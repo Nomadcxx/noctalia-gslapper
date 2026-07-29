@@ -170,6 +170,20 @@ local function targetsFor(target, connectors)
     return targets
 end
 
+local function commandTargets(action, target, connectors, durable)
+    local targets = targetsFor(target, connectors)
+    if (action ~= "pause" and action ~= "resume") or target ~= "*" then
+        return targets
+    end
+    local videos = {}
+    for _, connector in ipairs(targets) do
+        if durable[connector] and durable[connector].kind == "video" then
+            table.insert(videos, connector)
+        end
+    end
+    return videos
+end
+
 local function detectedConnectors()
     local connectors = {}
     for _, output in ipairs(noctalia.outputs()) do
@@ -1102,6 +1116,13 @@ local function runModelChecks()
     end)
     allThenOne["DP-1"] = copyTable(durable["eDP-1"])
     assert(allThenOne["DP-3"].kind == "video" and allThenOne["eDP-1"].kind == "video", "individual override changed other outputs")
+
+    local pauseTargets = commandTargets("pause", "*", connectors, {
+        ["DP-1"] = { kind = "video" },
+        ["DP-3"] = { kind = "image" },
+        ["eDP-1"] = { kind = "video" },
+    })
+    assert(table.concat(pauseTargets, ",") == "DP-1,eDP-1", "All pause targeted non-video outputs")
 end
 
 local function publishSelfTest(report)
@@ -1119,7 +1140,7 @@ local function runSelfTest(quiet)
     local ok, message = pcall(runModelChecks)
     local report = {
         passed = ok,
-        checks = 19,
+        checks = 20,
         error = ok and nil or tostring(message),
     }
 
@@ -1156,7 +1177,7 @@ local function handleCommand(command)
 
     local connectors = detectedConnectors()
     local target = command.action == "restore-all" and "*" or command.target
-    local targets = targetsFor(target, connectors)
+    local targets = commandTargets(command.action, target, connectors, assignments)
     local batch = { nonce = command.nonce, action = command.action, results = {} }
     commandBatches[command.nonce] = batch
 
@@ -1285,6 +1306,7 @@ return {
     runtime = runtime,
     detectedConnectors = detectedConnectors,
     targetsFor = targetsFor,
+    commandTargets = commandTargets,
     nextGeneration = nextGeneration,
     isCurrent = isCurrent,
     reconcileOutputs = reconcileOutputs,
