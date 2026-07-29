@@ -3,6 +3,21 @@
 local assignments = {}
 local runtime = {}
 local generations = {}
+local pending = {}
+local capabilities = { video = false, checking = true }
+
+local REQUIRED_FLAGS = {
+    "--fork",
+    "--ipc-socket",
+    "--no-save-state",
+    "--auto-pause",
+    "--auto-stop",
+    "--fps-cap",
+    "--transition-type",
+    "--transition-duration",
+}
+
+local VIDEO_CHANGE_RESTART_ERROR = "ERROR: cannot update path (use --auto-stop for video changes)"
 
 local function copyTable(value)
     local result = {}
@@ -18,6 +33,82 @@ local function copyList(values)
         result[index] = value
     end
     return result
+end
+
+local function validateShellValue(value)
+    if type(value) ~= "string" or value:find("[\n\r%z]") then
+        return nil, "value contains a forbidden control character"
+    end
+    return value
+end
+
+local function shellQuote(value)
+    local valid, message = validateShellValue(value)
+    if not valid then
+        return nil, message
+    end
+    return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function runtimeDirectory()
+    local base = noctalia.getenv("XDG_RUNTIME_DIR")
+    if not validateShellValue(base) or base == "" or base:sub(1, 1) ~= "/" then
+        return nil, "XDG_RUNTIME_DIR is unavailable"
+    end
+    return base .. "/noctalia-gslapper"
+end
+
+local function socketPathFor(connector, directory)
+    if type(connector) ~= "string" or connector == "" or type(directory) ~= "string" then
+        return nil
+    end
+    local safeConnector = connector:gsub("[^A-Za-z0-9_.-]", "_")
+    return directory .. "/" .. safeConnector .. ".sock"
+end
+
+local function isOwnedSocket(path, directory)
+    if type(path) ~= "string" or type(directory) ~= "string" then
+        return false
+    end
+    local prefix = directory .. "/"
+    if path:sub(1, #prefix) ~= prefix then
+        return false
+    end
+    local filename = path:sub(#prefix + 1)
+    return filename ~= "" and not filename:find("/", 1, true) and filename:match("^[A-Za-z0-9_.-]+%.sock$") ~= nil
+end
+
+local function processMatchNeedles(socketPath)
+    return { "gslapper", "--ipc-socket", socketPath }
+end
+
+local function hiddenFlags(behavior)
+    if behavior == "auto-pause" then
+        return { "--auto-pause" }
+    elseif behavior == "auto-stop" then
+        return { "--auto-stop" }
+    end
+    return {}
+end
+
+local function trim(value)
+    return (value:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function parseIpcResponse(command, raw)
+    raw = trim(raw or "")
+    if command == "query" then
+        local status, kind, path = raw:match("^STATUS: (%S+) (%S+) (.+)$")
+        if (status == "playing" or status == "paused") and (kind == "image" or kind == "video") then
+            return { ok = true, status = status, kind = kind, path = path, raw = raw }
+        end
+    elseif raw == "OK" or raw:sub(1, 4) == "OK: " then
+        return { ok = true, raw = raw }
+    elseif command == "change" and raw == VIDEO_CHANGE_RESTART_ERROR then
+        return { ok = false, restart = true, error = raw, raw = raw }
+    end
+
+    return { ok = false, error = raw ~= "" and raw or "gSlapper returned no response", raw = raw }
 end
 
 local function targetsFor(target, connectors)
@@ -39,6 +130,22 @@ local function detectedConnectors()
     end
     table.sort(connectors)
     return connectors
+end
+
+local function connectorDetected(connector)
+    if type(connector) ~= "string" or connector == "" then
+        return false
+    end
+    for _, detected in ipairs(detectedConnectors()) do
+        if connector == detected then
+            return true
+        end
+    end
+    return false
+end
+
+local function connectorBusy(connector)
+    return pending[connector] ~= nil or (runtime[connector] and runtime[connector].status == "starting")
 end
 
 local function nextGeneration(connector, store)
@@ -155,7 +262,7 @@ local function loadAssignments()
 
     local decoded, decodeError = noctalia.json.decode(contents)
     if type(decoded) ~= "table" or type(decoded.assignments) ~= "table" then
-        noctalia.log("warn", "Ignoring invalid assignments file: " .. tostring(decodeError or "invalid shape"))
+        noctalia.log("Ignoring invalid assignments file: " .. tostring(decodeError or "invalid shape"))
         return {}
     end
 
@@ -196,6 +303,514 @@ local function saveAssignments()
     return true
 end
 
+local function publishRuntime()
+    noctalia.state.set("runtime", runtime)
+end
+
+local function setPending(connector, operation)
+    pending[connector] = operation
+    noctalia.setUpdateInterval(100)
+end
+
+local function clearPending(connector, operation)
+    if operation == nil or pending[connector] == operation then
+        pending[connector] = nil
+    end
+    if next(pending) == nil then
+        noctalia.setUpdateInterval(1000)
+    end
+end
+
+local function validateMediaPath(path)
+    local valid, message = validateShellValue(path)
+    if not valid or path:sub(1, 1) ~= "/" or path == "/" then
+        return nil, message or "media path must be absolute"
+    end
+    local info, infoError = noctalia.fileInfo(path)
+    if not info or info.isDir then
+        return nil, infoError or "media path is not a file"
+    end
+    return path
+end
+
+local function ipcCommand(socketPath, command, callback)
+    if not isOwnedSocket(socketPath, runtimeDirectory()) then
+        callback({ ok = false, error = "refusing IPC outside the plugin runtime directory" })
+        return false
+    end
+    if not validateShellValue(command) then
+        callback({ ok = false, error = "IPC command contains a forbidden control character" })
+        return false
+    end
+
+    local quotedCommand = shellQuote(command)
+    local quotedSocket = shellQuote(socketPath)
+    local shellCommand = "printf '%s\\n' " .. quotedCommand .. " | socat -T 2 - UNIX-CONNECT:" .. quotedSocket
+    local started = noctalia.runAsync(shellCommand, function(result)
+        if result.exitCode ~= 0 then
+            callback({
+                ok = false,
+                error = trim(result.stderr ~= "" and result.stderr or "gSlapper IPC failed"),
+                notConnectable = not result.timedOut,
+                raw = result.stdout,
+            })
+            return
+        end
+        callback(parseIpcResponse(command:match("^(%S+)") or command, result.stdout))
+    end, 2000)
+    if not started then
+        callback({ ok = false, retryable = true, error = "Noctalia command capacity is busy" })
+    end
+    return started
+end
+
+local function normalizedSettings()
+    local scale = noctalia.getConfig("scale")
+    if scale ~= "fill" and scale ~= "stretch" and scale ~= "original" and scale ~= "panscan" then
+        scale = "fill"
+    end
+    if scale == "panscan" then
+        scale = "panscan=1.0"
+    end
+
+    local hidden = noctalia.getConfig("hidden_behavior")
+    if hidden ~= "continue" and hidden ~= "auto-pause" and hidden ~= "auto-stop" then
+        hidden = "auto-pause"
+    end
+
+    local fps = tostring(noctalia.getConfig("fps_cap") or "30")
+    if fps ~= "30" and fps ~= "60" and fps ~= "100" then
+        fps = "30"
+    end
+
+    local duration = tonumber(noctalia.getConfig("fade_duration")) or 0.5
+    duration = math.max(0.1, math.min(5.0, duration))
+
+    return {
+        scale = scale,
+        hidden = hidden,
+        loop = noctalia.getConfig("loop") ~= false,
+        fps = fps,
+        fade = noctalia.getConfig("fade") == true,
+        fadeDuration = duration,
+        gstOptions = tostring(noctalia.getConfig("gst_options") or ""),
+    }
+end
+
+local function buildLaunchCommand(connector, path, socketPath)
+    local directory = runtimeDirectory()
+    if not directory or not isOwnedSocket(socketPath, directory) then
+        return nil, "invalid plugin socket path"
+    end
+
+    local settings = normalizedSettings()
+    if not validateShellValue(settings.gstOptions) then
+        return nil, "GStreamer options contain a forbidden control character"
+    end
+
+    local gst = settings.scale .. " no-audio"
+    if settings.loop then
+        gst = gst .. " loop"
+    end
+    if settings.gstOptions ~= "" then
+        gst = gst .. " " .. settings.gstOptions
+    end
+
+    local arguments = {
+        "gslapper",
+        "--fork",
+        "--ipc-socket",
+        socketPath,
+        "--no-save-state",
+    }
+    for _, flag in ipairs(hiddenFlags(settings.hidden)) do
+        table.insert(arguments, flag)
+    end
+    table.insert(arguments, "--gst-options")
+    table.insert(arguments, gst)
+    table.insert(arguments, "--fps-cap")
+    table.insert(arguments, settings.fps)
+    table.insert(arguments, "--transition-type")
+    table.insert(arguments, settings.fade and "fade" or "none")
+    table.insert(arguments, "--transition-duration")
+    table.insert(arguments, tostring(settings.fadeDuration))
+    table.insert(arguments, connector)
+    table.insert(arguments, path)
+
+    local quoted = {}
+    for index, argument in ipairs(arguments) do
+        local value, message = shellQuote(argument)
+        if not value then
+            return nil, message
+        end
+        quoted[index] = value
+    end
+    return table.concat(quoted, " ")
+end
+
+local function setConnectorError(connector, generation, message)
+    if not isCurrent(connector, generation) then
+        return
+    end
+    clearPending(connector)
+    runtime[connector] = { status = "error", error = message }
+    noctalia.setWallpaperEnabled(connector, true)
+    publishRuntime()
+end
+
+local function setLiveError(connector, generation, message)
+    if not isCurrent(connector, generation) then
+        return
+    end
+    clearPending(connector)
+    local live = runtime[connector] or {}
+    runtime[connector] = {
+        status = "error",
+        error = message,
+        socket_path = live.socket_path,
+    }
+    publishRuntime()
+end
+
+local stopOwned
+
+local function commitVideo(connector, generation, assignment, query)
+    if not isCurrent(connector, generation) then
+        return
+    end
+    if not query.ok or query.kind ~= "video" or query.path ~= assignment.path then
+        setConnectorError(connector, generation, query.error or "gSlapper reported unexpected media")
+        return
+    end
+
+    local previous = assignments[connector]
+    assignments[connector] = copyTable(assignment)
+    local saved, saveError = saveAssignments()
+    if not saved then
+        assignments[connector] = previous
+        setConnectorError(connector, generation, saveError)
+        stopOwned(connector, generation)
+        return
+    end
+
+    clearPending(connector)
+    noctalia.setWallpaperEnabled(connector, false)
+    runtime[connector] = {
+        status = query.status,
+        error = nil,
+        socket_path = runtime[connector] and runtime[connector].socket_path,
+    }
+    publishRuntime()
+end
+
+local function awaitVideo(connector, generation, assignment, socketPath)
+    local operation = {
+        kind = "ready",
+        generation = generation,
+        assignment = assignment,
+        socketPath = socketPath,
+        deadline = noctalia.nowMs() + 5000,
+        inFlight = false,
+    }
+    setPending(connector, operation)
+end
+
+local function launchVideo(connector, generation, assignment)
+    if not isCurrent(connector, generation) then
+        return
+    end
+
+    local directory, directoryError = runtimeDirectory()
+    if not directory then
+        setConnectorError(connector, generation, directoryError)
+        return
+    end
+    local made, makeError = noctalia.mkdirAll(directory)
+    if not made then
+        setConnectorError(connector, generation, makeError or "could not create runtime directory")
+        return
+    end
+
+    local socketPath = socketPathFor(connector, directory)
+    local command, commandError = buildLaunchCommand(connector, assignment.path, socketPath)
+    if not command then
+        setConnectorError(connector, generation, commandError)
+        return
+    end
+
+    runtime[connector] = { status = "starting", socket_path = socketPath }
+    publishRuntime()
+    local started = noctalia.runAsync(command, function(result)
+        if not isCurrent(connector, generation) then
+            return
+        end
+        if result.exitCode ~= 0 then
+            setConnectorError(connector, generation, trim(result.stderr ~= "" and result.stderr or "gSlapper failed to start"))
+            return
+        end
+        awaitVideo(connector, generation, assignment, socketPath)
+    end, 5000)
+    if not started then
+        setConnectorError(connector, generation, "Noctalia command capacity is busy")
+    end
+end
+
+local function regexEscape(value)
+    return (value:gsub("([^%w])", "%%%1"))
+end
+
+local function processFallback(connector, generation, socketPath, after)
+    local directory = runtimeDirectory()
+    if not directory or not isOwnedSocket(socketPath, directory) then
+        setConnectorError(connector, generation, "refusing process fallback for an unowned socket")
+        return
+    end
+    local needles = processMatchNeedles(socketPath)
+    local started = noctalia.processMatches(function(matched)
+        if not isCurrent(connector, generation) then
+            return
+        end
+        if not matched then
+            if after then
+                after()
+            end
+            return
+        end
+
+        local pattern = "[g]slapper.*--ipc-socket[ =]" .. regexEscape(socketPath)
+        local command = "pkill -TERM -f -- " .. shellQuote(pattern)
+        local killStarted = noctalia.runAsync(command, function()
+            if isCurrent(connector, generation) and after then
+                after()
+            end
+        end, 2000)
+        if not killStarted and after then
+            after()
+        end
+    end, needles[1], needles[2], needles[3])
+    if not started and after then
+        after()
+    end
+end
+
+stopOwned = function(connector, generation, after)
+    if not isCurrent(connector, generation) then
+        return
+    end
+
+    local directory = runtimeDirectory()
+    local socketPath = directory and socketPathFor(connector, directory)
+    if not socketPath or not noctalia.fileExists(socketPath) then
+        if after then
+            after()
+        end
+        return
+    end
+
+    ipcCommand(socketPath, "stop", function()
+        if not isCurrent(connector, generation) then
+            return
+        end
+        setPending(connector, {
+            kind = "stop",
+            generation = generation,
+            socketPath = socketPath,
+            deadline = noctalia.nowMs() + 2000,
+            after = after,
+            inFlight = false,
+        })
+    end)
+end
+
+local function changeVideo(connector, generation, assignment, socketPath)
+    ipcCommand(socketPath, "change " .. assignment.path, function(change)
+        if not isCurrent(connector, generation) then
+            return
+        end
+        if change.ok then
+            awaitVideo(connector, generation, assignment, socketPath)
+        elseif change.restart then
+            stopOwned(connector, generation, function()
+                launchVideo(connector, generation, assignment)
+            end)
+        else
+            setLiveError(connector, generation, change.error)
+        end
+    end)
+end
+
+local function assignVideo(connector, path, previewPath)
+    if not connectorDetected(connector) then
+        return false, "output is not connected"
+    end
+    if connectorBusy(connector) then
+        return false, "output switch is already in progress"
+    end
+    local validPath, pathError = validateMediaPath(path)
+    if not validPath then
+        return false, pathError
+    end
+    if previewPath ~= nil and not validateMediaPath(previewPath) then
+        previewPath = nil
+    end
+    if not capabilities.video then
+        return false, capabilities.error or "video support is unavailable"
+    end
+
+    local generation = nextGeneration(connector)
+    local assignment = {
+        kind = "video",
+        path = validPath,
+        preview_path = previewPath,
+        desired_playback = "playing",
+    }
+    if previewPath then
+        noctalia.setWallpaper(connector, previewPath)
+    end
+
+    local directory = runtimeDirectory()
+    local socketPath = directory and socketPathFor(connector, directory)
+    if socketPath and noctalia.fileExists(socketPath) then
+        runtime[connector] = { status = "starting", socket_path = socketPath }
+        publishRuntime()
+        ipcCommand(socketPath, "query", function(query)
+            if not isCurrent(connector, generation) then
+                return
+            end
+            if query.ok and query.kind == "video" and query.path == assignment.path then
+                commitVideo(connector, generation, assignment, query)
+            elseif query.ok then
+                changeVideo(connector, generation, assignment, socketPath)
+            elseif query.notConnectable then
+                if isOwnedSocket(socketPath, directory) then
+                    noctalia.removeFile(socketPath)
+                end
+                launchVideo(connector, generation, assignment)
+            else
+                setLiveError(connector, generation, query.error)
+            end
+        end)
+    else
+        launchVideo(connector, generation, assignment)
+    end
+    return true
+end
+
+local function assignImage(connector, path)
+    if not connectorDetected(connector) then
+        return false, "output is not connected"
+    end
+    if connectorBusy(connector) then
+        return false, "output switch is already in progress"
+    end
+    local validPath, pathError = validateMediaPath(path)
+    if not validPath then
+        return false, pathError
+    end
+
+    local generation = nextGeneration(connector)
+    local previous = assignments[connector]
+    noctalia.setWallpaper(connector, validPath)
+    assignments[connector] = {
+        kind = "image",
+        path = validPath,
+        desired_playback = "playing",
+    }
+    local saved, saveError = saveAssignments()
+    if not saved then
+        assignments[connector] = previous
+        return false, saveError
+    end
+
+    noctalia.setWallpaperEnabled(connector, true)
+    runtime[connector] = { status = "static" }
+    publishRuntime()
+    stopOwned(connector, generation)
+    return true
+end
+
+local function setPlayback(connector, desired)
+    local assignment = assignments[connector]
+    local live = runtime[connector]
+    if not assignment or assignment.kind ~= "video" or not live or not live.socket_path then
+        return false, "output has no active video"
+    end
+    if connectorBusy(connector) then
+        return false, "output switch is already in progress"
+    end
+
+    local generation = nextGeneration(connector)
+    local previousDesired = assignment.desired_playback
+    live.status = "starting"
+    live.error = nil
+    publishRuntime()
+    ipcCommand(live.socket_path, desired == "paused" and "pause" or "resume", function(result)
+        if not isCurrent(connector, generation) or not result.ok then
+            if isCurrent(connector, generation) and not result.ok then
+                setLiveError(connector, generation, result.error)
+            end
+            return
+        end
+        ipcCommand(live.socket_path, "query", function(query)
+            if not isCurrent(connector, generation) then
+                return
+            end
+            if not query.ok or query.status ~= desired then
+                setLiveError(connector, generation, query.error or "playback state did not change")
+                return
+            end
+            assignment.desired_playback = desired
+            local saved, saveError = saveAssignments()
+            if not saved then
+                assignment.desired_playback = previousDesired
+                setLiveError(connector, generation, saveError)
+                return
+            end
+            runtime[connector].status = query.status
+            publishRuntime()
+        end)
+    end)
+    return true
+end
+
+local function probeCapabilities()
+    if not noctalia.commandExists("gslapper") then
+        capabilities = { video = false, checking = false, error = "gSlapper is not installed" }
+        noctalia.state.set("capabilities", capabilities)
+        return
+    end
+    if not noctalia.commandExists("socat") then
+        capabilities = { video = false, checking = false, error = "socat is not installed" }
+        noctalia.state.set("capabilities", capabilities)
+        return
+    end
+
+    noctalia.state.set("capabilities", capabilities)
+    local started = noctalia.runAsync("gslapper --help", function(result)
+        local missing = {}
+        local help = result.stdout .. result.stderr
+        for _, flag in ipairs(REQUIRED_FLAGS) do
+            if not help:find(flag, 1, true) then
+                table.insert(missing, flag)
+            end
+        end
+        if result.exitCode == 0 and #missing == 0 then
+            capabilities = { video = true, checking = false, tested_version = "1.5.2" }
+        else
+            capabilities = {
+                video = false,
+                checking = false,
+                error = "gSlapper is missing required IPC options: " .. table.concat(missing, ", "),
+            }
+        end
+        noctalia.state.set("capabilities", capabilities)
+    end, 2000)
+    if not started then
+        capabilities = { video = false, checking = false, error = "could not run the gSlapper compatibility check" }
+        noctalia.state.set("capabilities", capabilities)
+    end
+end
+
 local function runModelChecks()
     local connectors = { "eDP-1", "DP-1", "DP-3" }
 
@@ -231,6 +846,23 @@ local function runModelChecks()
     end)
     assert(not results["DP-1"].ok, "fixture failure was not reported")
     assert(batchDurable["eDP-1"] ~= nil and batchDurable["DP-3"] ~= nil, "partial failure erased successful targets")
+
+    assert(shellQuote("/tmp/a b's.mp4") == "'/tmp/a b'\\''s.mp4'", "apostrophe quoting failed")
+    assert(validateShellValue("line\nbreak") == nil and validateShellValue("nul\0byte") == nil, "control character accepted")
+
+    local testDirectory = "/run/user/1000/noctalia-gslapper"
+    local socketPath = socketPathFor("../DP/1", testDirectory)
+    assert(socketPath == testDirectory .. "/.._DP_1.sock", "connector escaped runtime directory")
+    assert(isOwnedSocket(socketPath, testDirectory) and not isOwnedSocket("/tmp/DP-1.sock", testDirectory), "socket ownership failed")
+
+    local needles = processMatchNeedles(socketPath)
+    assert(needles[1] == "gslapper" and needles[3] == socketPath, "process match omitted exact socket")
+    assert(#hiddenFlags("continue") == 0 and #hiddenFlags("auto-pause") == 1 and #hiddenFlags("auto-stop") == 1, "hidden flags conflict")
+
+    local query = parseIpcResponse("query", "STATUS: paused video /tmp/a b.mp4\n")
+    assert(query.ok and query.status == "paused" and query.path == "/tmp/a b.mp4", "query response parsing failed")
+    assert(parseIpcResponse("pause", "OK\n").ok, "success response parsing failed")
+    assert(parseIpcResponse("change", VIDEO_CHANGE_RESTART_ERROR .. "\n").restart, "video-change recovery parsing failed")
 end
 
 local function publishSelfTest(report)
@@ -248,7 +880,7 @@ local function runSelfTest(quiet)
     local ok, message = pcall(runModelChecks)
     local report = {
         passed = ok,
-        checks = 6,
+        checks = 13,
         error = ok and nil or tostring(message),
     }
 
@@ -270,8 +902,54 @@ function onIpc(event, _payload)
     end
 end
 
+function update()
+    local now = noctalia.nowMs()
+    for connector, operation in pairs(pending) do
+        if not isCurrent(connector, operation.generation) then
+            clearPending(connector, operation)
+        elseif operation.kind == "ready" and not operation.inFlight then
+            operation.inFlight = true
+            ipcCommand(operation.socketPath, "query", function(query)
+                if pending[connector] ~= operation or not isCurrent(connector, operation.generation) then
+                    return
+                end
+                operation.inFlight = false
+                if query.ok and query.kind == "video" and query.path == operation.assignment.path then
+                    commitVideo(connector, operation.generation, operation.assignment, query)
+                elseif noctalia.nowMs() >= operation.deadline then
+                    setConnectorError(connector, operation.generation, query.error or "gSlapper readiness timed out")
+                    stopOwned(connector, operation.generation)
+                end
+            end)
+        elseif operation.kind == "stop" then
+            if not noctalia.fileExists(operation.socketPath) then
+                clearPending(connector, operation)
+                if operation.after then
+                    operation.after()
+                end
+            elseif now >= operation.deadline and not operation.inFlight then
+                operation.inFlight = true
+                ipcCommand(operation.socketPath, "query", function(query)
+                    if pending[connector] ~= operation or not isCurrent(connector, operation.generation) then
+                        return
+                    end
+                    clearPending(connector, operation)
+                    local directory = runtimeDirectory()
+                    if query.notConnectable and directory and isOwnedSocket(operation.socketPath, directory) then
+                        noctalia.removeFile(operation.socketPath)
+                    end
+                    processFallback(connector, operation.generation, operation.socketPath, operation.after)
+                end)
+            end
+        end
+    end
+end
+
 noctalia.setUpdateInterval(1000)
 assignments = loadAssignments()
+if type(noctalia.commandExists) == "function" then
+    probeCapabilities()
+end
 
 return {
     assignments = assignments,
@@ -283,5 +961,16 @@ return {
     reconcileOutputs = reconcileOutputs,
     validateAssignment = validateAssignment,
     saveAssignments = saveAssignments,
+    validateShellValue = validateShellValue,
+    shellQuote = shellQuote,
+    socketPathFor = socketPathFor,
+    isOwnedSocket = isOwnedSocket,
+    processMatchNeedles = processMatchNeedles,
+    hiddenFlags = hiddenFlags,
+    parseIpcResponse = parseIpcResponse,
+    buildLaunchCommand = buildLaunchCommand,
+    assignVideo = assignVideo,
+    assignImage = assignImage,
+    setPlayback = setPlayback,
     runSelfTest = runSelfTest,
 }
