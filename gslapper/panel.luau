@@ -2,9 +2,8 @@
 
 local IMAGE_EXTENSIONS = { jpg = true, jpeg = true, png = true, webp = true, jxl = true, bmp = true }
 local VIDEO_EXTENSIONS = { mp4 = true, mkv = true, webm = true, mov = true, avi = true, m4v = true, gif = true }
-local PAGE_SIZE = 8
-local THUMBNAIL_LIMIT = 2
-local SCAN_BATCH_SIZE = 12
+local GRID_BATCH_SIZE = 12
+local PAGE_SIZE = 24
 
 local filter = "all"
 local search = ""
@@ -13,14 +12,9 @@ local currentRoot = nil
 local currentDirectory = nil
 local entries = {}
 local scanError = nil
-local thumbnailJobs = {}
-local thumbnailQueue = {}
-local thumbnailActive = 0
-local thumbnailsAvailable = false
-local scanTasks = {}
-local scanMessages = {}
-local scanning = false
-local scanGeneration = 0
+local library = noctalia.state.get("library") or {}
+local libraryStatus = noctalia.state.get("library_status") or { phase = "scanning" }
+local scanning = libraryStatus.phase == "scanning"
 local assignments = noctalia.state.get("assignments") or {}
 local runtime = noctalia.state.get("runtime") or {}
 local capabilities = noctalia.state.get("capabilities") or { video = false, checking = true }
@@ -29,6 +23,23 @@ local commandResult = noctalia.state.get("command_result")
 local selectedOutput = "*"
 local nonceCounter = 0
 local outputOptions = {}
+local folderEntries = {}
+local gridRows = nil
+local gridBuilding = false
+local gridGeneration = 0
+local gridProgress = 0
+local indexBuilding = false
+local indexGeneration = 0
+local indexProgress = 0
+local loadedLibraryVersion = nil
+local viewMedia = {}
+local viewDirectories = {}
+local viewBuilding = false
+local viewDirty = true
+local viewGeneration = 0
+local viewProgress = 0
+local loadingPulse = 0
+local loadingElapsed = 0
 local render
 
 local function tr(key, substitutions)
@@ -41,13 +52,6 @@ local function trimTrailingSlash(path)
     end
     path = path:gsub("/+$", "")
     return path == "" and "/" or path
-end
-
-local function roots()
-    local image = trimTrailingSlash(noctalia.wallpaperDirectory())
-    local configured = noctalia.getConfig("video_directory")
-    local video = trimTrailingSlash(type(configured) == "string" and noctalia.expandPath(configured) or nil)
-    return image, video
 end
 
 local function classifyName(name)
@@ -131,6 +135,7 @@ local function videoPlaybackAction(values, liveState, connectors)
 end
 
 local function fnv1a32(value)
+    -- ponytail: this mirrors the service cache key; use a wider digest if a real collision appears.
     local hash = 2166136261
     for index = 1, #value do
         hash = bit32.bxor(hash, value:byte(index))
@@ -141,202 +146,172 @@ local function fnv1a32(value)
     return string.format("%08x", hash)
 end
 
-local function shellQuote(value)
-    if type(value) ~= "string" or value:find("[\n\r%z]") then
-        return nil
-    end
-    return "'" .. value:gsub("'", "'\\''") .. "'"
-end
-
-local function thumbnailPath(path, info)
+local function thumbnailPath(path, size, mtime)
     local directory = noctalia.pluginDataDir()
     if not directory then
         return nil
     end
-    local fingerprint = "v2:" .. path .. ":" .. tostring(info.size or 0) .. ":" .. tostring(info.mtime or 0)
-    return directory .. "/thumb-" .. fnv1a32(fingerprint) .. ".png"
+    return directory .. "/thumb-" .. fnv1a32("v3:" .. path .. ":" .. tostring(size) .. ":" .. tostring(mtime)) .. ".jpg"
 end
 
-local function startThumbnailJobs()
-    while thumbnailsAvailable and thumbnailActive < THUMBNAIL_LIMIT and #thumbnailQueue > 0 do
-        local job = table.remove(thumbnailQueue, 1)
-        if thumbnailJobs[job.key] == "queued" then
-            thumbnailJobs[job.key] = "running"
-            thumbnailActive = thumbnailActive + 1
-            local temporary = job.thumbnail .. ".tmp"
-            local command = "gst-launch-1.0 -q filesrc location=" .. shellQuote(job.path)
-                .. " ! decodebin ! videoconvert ! videoscale"
-                .. " ! video/x-raw,width=320,height=180,pixel-aspect-ratio=1/1"
-                .. " ! pngenc snapshot=true ! filesink location=" .. shellQuote(temporary)
-            local started = noctalia.runAsync(command, function(result)
-                thumbnailActive = thumbnailActive - 1
-                if result.exitCode == 0 and noctalia.fileExists(temporary) then
-                    local renamed = noctalia.renameFile(temporary, job.thumbnail)
-                    thumbnailJobs[job.key] = renamed and "ready" or "failed"
-                else
-                    noctalia.removeFile(temporary)
-                    thumbnailJobs[job.key] = "failed"
-                end
-                startThumbnailJobs()
-                if render then
-                    render()
-                end
-            end, 15000)
-            if not started then
-                thumbnailActive = thumbnailActive - 1
-                thumbnailJobs[job.key] = "failed"
-            end
-        end
+local function invalidateGrid()
+    gridGeneration = gridGeneration + 1
+    gridRows = nil
+    gridBuilding = false
+    gridProgress = 0
+end
+
+local function invalidateView()
+    viewGeneration = viewGeneration + 1
+    viewMedia = {}
+    viewDirectories = {}
+    viewBuilding = false
+    viewDirty = true
+    viewProgress = 0
+    invalidateGrid()
+end
+
+local function nextNulField(raw, offset)
+    local boundary = raw:find("\0", offset, true)
+    if not boundary then
+        return nil, offset
     end
+    return raw:sub(offset, boundary - 1), boundary + 1
 end
 
-local function queueThumbnail(entry)
-    if not thumbnailsAvailable or entry.kind == "directory" then
+local function acceptsMedia(rootKind, kind, name)
+    if rootKind == "mixed" or rootKind == "video" then
+        return rootKind == "mixed" or kind == "video"
+    end
+    return kind == "image" or name:lower():match("%.gif$") ~= nil
+end
+
+local function finishIndexBuild(generation, value)
+    if generation ~= indexGeneration then
         return
     end
-    local info = entry.info or noctalia.fileInfo(entry.path)
-    if not info or info.isDir then
-        return
-    end
-    local cached = thumbnailPath(entry.path, info)
-    entry.thumbnail = cached
-    if cached and noctalia.fileExists(cached) then
-        thumbnailJobs[cached] = "ready"
-    elseif cached and (not thumbnailJobs[cached] or thumbnailJobs[cached] == "failed") then
-        thumbnailJobs[cached] = "queued"
-        table.insert(thumbnailQueue, { key = cached, path = entry.path, thumbnail = cached })
-    end
-end
-
-local function queueDirectoryScan(rootKind, root, directory, accepted)
-    local names, message = noctalia.listDir(directory)
-    if not names then
-        return false, message or "directory is unreadable"
-    end
-    table.insert(scanTasks, {
-        rootKind = rootKind,
-        root = root,
-        directory = directory,
-        accepted = accepted,
-        names = names,
-        index = 1,
-    })
-    return true
-end
-
-local function finishScan()
-    scanning = false
-    scanError = #scanMessages > 0 and table.concat(scanMessages, "; ") or nil
-    sortEntries(entries)
-    page = math.max(1, math.min(page, math.max(1, math.ceil(#entries / PAGE_SIZE))))
-    render()
-end
-
-local scheduleScanBatch
-local function processScanBatch(generation)
-    if generation ~= scanGeneration then
-        return
-    end
-    local remaining = SCAN_BATCH_SIZE
-    while remaining > 0 and #scanTasks > 0 do
-        local task = scanTasks[1]
-        local name = task.names[task.index]
-        if name == nil then
-            table.remove(scanTasks, 1)
-        else
-            task.index = task.index + 1
-            remaining = remaining - 1
-            local path = safeChild(task.root, task.directory, name)
-            if path then
-                local info = noctalia.fileInfo(path)
-                if info and info.isDir then
-                    table.insert(entries, {
-                        name = name,
-                        path = path,
-                        kind = "directory",
-                        root = task.root,
-                        rootKind = task.rootKind,
-                    })
-                elseif info then
-                    local kind = classifyName(name)
-                    local allowedVideo = task.rootKind ~= "image" or name:lower():match("%.gif$") ~= nil
-                    if kind and task.accepted[kind] and (kind ~= "video" or allowedVideo) then
-                        table.insert(entries, {
-                            name = name,
-                            path = path,
-                            kind = kind,
-                            root = task.root,
-                            rootKind = task.rootKind,
-                            info = info,
-                        })
-                    end
-                end
-            end
-        end
-    end
-    if #scanTasks == 0 then
-        finishScan()
-    else
-        scheduleScanBatch(generation)
-    end
-end
-
-scheduleScanBatch = function(generation)
-    local started = noctalia.runAsync(":", function()
-        processScanBatch(generation)
-    end, 2000)
-    if not started and generation == scanGeneration then
-        scanning = false
-        scanError = "Noctalia command capacity is busy"
+    library = value
+    loadedLibraryVersion = value.version
+    indexBuilding = false
+    indexProgress = 1
+    invalidateView()
+    local started = noctalia.runAsync(":", render, 2000)
+    if not started then
         render()
     end
 end
 
-local function rescan()
+local function loadLibrary(value)
+    if type(value) ~= "table" then
+        return false
+    end
+    if value.version == loadedLibraryVersion and not indexBuilding then
+        return true
+    end
+    if type(value.entries) == "table" then
+        library = value
+        entries = value.entries
+        sortEntries(entries)
+        loadedLibraryVersion = value.version
+        indexBuilding = false
+        invalidateView()
+        return true
+    end
+    if type(value.sources) ~= "table" then
+        return false
+    end
+
+    indexGeneration = indexGeneration + 1
+    local generation = indexGeneration
+    local tasks = {}
+    local totalBytes = 0
+    local consumedBytes = 0
     entries = {}
-    scanError = nil
-    scanTasks = {}
-    scanMessages = {}
-    scanning = true
-    scanGeneration = scanGeneration + 1
-    local generation = scanGeneration
-    local imageRoot, videoRoot = roots()
-
-    if currentDirectory then
-        local accepted = filter == "images" and { image = true }
-            or filter == "videos" and { video = true }
-            or { image = true, video = true }
-        local scanned, message = queueDirectoryScan(currentRoot.kind, currentRoot.path, currentDirectory, accepted)
-        if not scanned then
-            table.insert(scanMessages, message)
-        end
-    else
-        if imageRoot and videoRoot == imageRoot then
-            local accepted = filter == "images" and { image = true }
-                or filter == "videos" and { video = true }
-                or { image = true, video = true }
-            local scanned, message = queueDirectoryScan("video", imageRoot, imageRoot, accepted)
-            if not scanned then table.insert(scanMessages, message) end
+    indexBuilding = true
+    indexProgress = 0
+    for _, source in ipairs(value.sources) do
+        local raw = noctalia.readFile(source.path)
+        if type(raw) == "string" then
+            totalBytes = totalBytes + #raw
+            table.insert(tasks, {
+                raw = raw,
+                offset = 1,
+                root = source.root,
+                rootKind = source.rootKind,
+            })
         else
-            if imageRoot then
-                local accepted = filter == "images" and { image = true }
-                    or filter == "videos" and { video = true }
-                    or { image = true, video = true }
-                local scanned, message = queueDirectoryScan("image", imageRoot, imageRoot, accepted)
-                if not scanned then table.insert(scanMessages, message) end
-            end
-            if filter ~= "images" and videoRoot then
-                local scanned, message = queueDirectoryScan("video", videoRoot, videoRoot, { video = true })
-                if not scanned then table.insert(scanMessages, message) end
-            end
+            scanError = "Wallpaper index is unavailable"
         end
     end
 
-    if #scanTasks == 0 then
-        finishScan()
-    else
-        scheduleScanBatch(generation)
+    local processBatch
+    processBatch = function()
+        if generation ~= indexGeneration then
+            return
+        end
+        local remaining = GRID_BATCH_SIZE
+        while remaining > 0 and #tasks > 0 do
+            local task = tasks[1]
+            local previousOffset = task.offset
+            local fileType
+            fileType, task.offset = nextNulField(task.raw, task.offset)
+            if not fileType then
+                table.remove(tasks, 1)
+            else
+                local size
+                local mtime
+                local path
+                size, task.offset = nextNulField(task.raw, task.offset)
+                mtime, task.offset = nextNulField(task.raw, task.offset)
+                path, task.offset = nextNulField(task.raw, task.offset)
+                consumedBytes = consumedBytes + task.offset - previousOffset
+                remaining = remaining - 1
+                if path and utf8.len(path) ~= nil then
+                    local name = path:match("([^/]+)$")
+                    local parent = path:match("^(.*)/[^/]+$")
+                    if fileType == "d" then
+                        table.insert(entries, {
+                            name = name,
+                            path = path,
+                            parent = parent,
+                            kind = "directory",
+                            root = task.root,
+                            rootKind = task.rootKind,
+                        })
+                    elseif fileType == "f" then
+                        local kind = classifyName(name)
+                        if kind and acceptsMedia(task.rootKind, kind, name) then
+                            local numericSize = tonumber(size) or 0
+                            local numericMtime = tonumber(mtime) or 0
+                            table.insert(entries, {
+                                name = name,
+                                path = path,
+                                parent = parent,
+                                kind = kind,
+                                root = task.root,
+                                rootKind = task.rootKind,
+                                thumbnail = thumbnailPath(path, numericSize, numericMtime),
+                            })
+                        end
+                    end
+                end
+            end
+        end
+        indexProgress = totalBytes > 0 and math.min(1, consumedBytes / totalBytes) or 1
+        if #tasks == 0 then
+            finishIndexBuild(generation, value)
+            return
+        end
+        local started = noctalia.runAsync(":", processBatch, 2000)
+        if not started then
+            indexBuilding = false
+            scanError = "Noctalia command capacity is busy"
+            render()
+        end
     end
+
+    processBatch()
+    return true
 end
 
 local function partitionEntries(values, needle)
@@ -344,28 +319,84 @@ local function partitionEntries(values, needle)
     local media = {}
     needle = tostring(needle or ""):lower()
     for _, entry in ipairs(values or {}) do
-        if entry.kind == "directory" then
+        local inDirectory = currentDirectory and entry.parent == currentDirectory or not currentDirectory and entry.parent == entry.root
+        if inDirectory and entry.kind == "directory" then
             table.insert(directories, entry)
-        elseif needle == "" or entry.name:lower():find(needle, 1, true) then
+        elseif inDirectory
+            and (filter == "all" or filter == "images" and entry.kind == "image" or filter == "videos" and entry.kind == "video")
+            and (needle == "" or entry.name:lower():find(needle, 1, true)) then
             table.insert(media, entry)
         end
     end
     return directories, media
 end
 
-local function visibleEntries()
-    local directories, filtered = partitionEntries(entries, search)
-    local pages = math.max(1, math.ceil(#filtered / PAGE_SIZE))
-    page = math.max(1, math.min(page, pages))
-    local first = (page - 1) * PAGE_SIZE + 1
-    local visible = {}
-    for index = first, math.min(#filtered, first + PAGE_SIZE - 1) do
-        local entry = filtered[index]
-        queueThumbnail(entry)
-        table.insert(visible, entry)
+local function beginViewBuild()
+    viewGeneration = viewGeneration + 1
+    local generation = viewGeneration
+    local index = 1
+    local needle = search:lower()
+    viewMedia = {}
+    viewDirectories = {}
+    viewBuilding = true
+    viewDirty = false
+    viewProgress = 0
+
+    local processBatch
+    processBatch = function()
+        if generation ~= viewGeneration then
+            return
+        end
+        local last = math.min(#entries, index + GRID_BATCH_SIZE - 1)
+        while index <= last do
+            local entry = entries[index]
+            local inDirectory = currentDirectory and entry.parent == currentDirectory
+                or not currentDirectory and entry.parent == entry.root
+            if inDirectory and entry.kind == "directory" then
+                table.insert(viewDirectories, entry)
+            elseif inDirectory
+                and (filter == "all" or filter == "images" and entry.kind == "image"
+                    or filter == "videos" and entry.kind == "video")
+                and (needle == "" or entry.name:lower():find(needle, 1, true)) then
+                table.insert(viewMedia, entry)
+            end
+            index = index + 1
+        end
+        viewProgress = #entries == 0 and 1 or math.min(1, (index - 1) / #entries)
+        if index > #entries then
+            sortEntries(viewDirectories)
+            sortEntries(viewMedia)
+            viewBuilding = false
+            invalidateGrid()
+            render()
+            return
+        end
+        local started = noctalia.runAsync(":", processBatch, 2000)
+        if not started then
+            viewBuilding = false
+            scanError = "Noctalia command capacity is busy"
+            render()
+        end
     end
-    startThumbnailJobs()
-    return visible, #filtered, pages, directories
+
+    processBatch()
+end
+
+local function paginate(values, requestedPage)
+    local pages = math.max(1, math.ceil(#values / PAGE_SIZE))
+    local currentPage = math.max(1, math.min(requestedPage, pages))
+    local first = (currentPage - 1) * PAGE_SIZE + 1
+    local visible = {}
+    for index = first, math.min(#values, first + PAGE_SIZE - 1) do
+        table.insert(visible, values[index])
+    end
+    return visible, currentPage, pages
+end
+
+local function visibleEntries()
+    local visible, currentPage, pages = paginate(viewMedia, page)
+    page = currentPage
+    return visible, #viewMedia, pages, viewDirectories
 end
 
 local function connectorNames()
@@ -412,27 +443,20 @@ local function selectionBusy()
 end
 
 local function navigateDirectory(entry)
-    local rootQuoted = shellQuote(entry.root)
-    local childQuoted = shellQuote(entry.path)
-    if not rootQuoted or not childQuoted then
+    if type(entry) ~= "table" or entry.kind ~= "directory"
+        or type(entry.root) ~= "string" or type(entry.path) ~= "string"
+        or (entry.path ~= entry.root and entry.path:sub(1, #entry.root + 1) ~= entry.root .. "/") then
+        scanError = tr("panel.navigation_blocked")
+        render()
         return
     end
-    local command = "readlink -f -- " .. rootQuoted .. "\nreadlink -f -- " .. childQuoted
-    noctalia.runAsync(command, function(result)
-        local canonicalRoot, canonicalChild = (result.stdout or ""):match("^([^\n]+)\n([^\n]+)")
-        if result.exitCode ~= 0 or not canonicalRoot or not canonicalChild
-            or (canonicalChild ~= canonicalRoot and canonicalChild:sub(1, #canonicalRoot + 1) ~= canonicalRoot .. "/") then
-            scanError = tr("panel.navigation_blocked")
-            render()
-            return
-        end
-        currentRoot = { kind = entry.rootKind, path = entry.root }
-        currentDirectory = entry.path
-        search = ""
-        page = 1
-        rescan()
-        render()
-    end, 2000)
+    currentRoot = { kind = entry.rootKind, path = entry.root }
+    currentDirectory = entry.path
+    search = ""
+    page = 1
+    scanError = libraryStatus.error
+    invalidateView()
+    render()
 end
 
 local function navigateUp()
@@ -445,14 +469,15 @@ local function navigateUp()
     else
         local parent = currentDirectory:match("^(.*)/[^/]+$")
         if not parent or parent == currentRoot.path then
-            currentDirectory = currentRoot.path
+            currentDirectory = nil
+            currentRoot = nil
         else
             currentDirectory = parent
         end
     end
     search = ""
     page = 1
-    rescan()
+    invalidateView()
     render()
 end
 
@@ -461,6 +486,12 @@ local function tileFor(entry, connectors)
     local selected = #connectors > 0 and matches == #connectors
     local videoDisabled = entry.kind == "video" and not capabilities.video
     local busy = selectionBusy()
+    local choose
+    if not videoDisabled and not busy then
+        choose = function()
+            sendCommand(entry.kind == "image" and "assign-image" or "assign-video", entry)
+        end
+    end
     local preview
     if entry.thumbnail and noctalia.fileExists(entry.thumbnail) then
         preview = ui.image({
@@ -468,78 +499,135 @@ local function tileFor(entry, connectors)
             height = 96,
             fit = "cover",
             radius = 8,
+            border = selected and "primary" or "outline/0.45",
+            borderWidth = selected and 2 or 1,
+            onClick = choose,
         })
     else
-        preview = ui.column({ height = 96, radius = 8, fill = "surface_variant/0.55", align = "center", justify = "center" }, {
-            ui.glyph({
-                name = entry.kind == "image" and "photo" or "player-play",
-                size = 36,
-                color = videoDisabled and "outline" or (entry.kind == "image" and "primary" or "secondary"),
-            }),
+        preview = ui.button({
+            height = 96,
+            glyph = entry.kind == "image" and "photo" or "player-play",
+            glyphSize = 36,
+            variant = "ghost",
+            enabled = choose ~= nil,
+            selected = selected,
+            onClick = choose,
         })
     end
 
-    local badges = {}
+    local detail = entry.name
     if entry.kind == "video" then
-        table.insert(badges, ui.label({ text = tr("panel.video_badge"), fontSize = 10, color = "secondary", fontWeight = "bold" }))
+        detail = tr("panel.video_badge") .. " · " .. detail
     end
     if selectedOutput == "*" and matches > 0 and matches < #connectors then
-        table.insert(badges, ui.label({
-            text = tr("panel.partial_badge", { count = matches, total = #connectors }),
-            fontSize = 10,
-            color = "primary",
-            fontWeight = "bold",
-        }))
+        detail = detail .. " · " .. tr("panel.partial_badge", { count = matches, total = #connectors })
     end
 
-    local props = {
+    return ui.column({
         key = entry.path,
         width = 210,
-        gap = 6,
-        padding = 7,
-        radius = 10,
-        border = selected and "primary" or "outline/0.45",
-        borderWidth = selected and 2 or 1,
-        fill = selected and "primary/0.08" or "surface_variant/0.20",
+        gap = 5,
         opacity = videoDisabled and 0.55 or 1,
-    }
-    if not videoDisabled and not busy then
-        props.onClick = function()
-            sendCommand(entry.kind == "image" and "assign-image" or "assign-video", entry)
+    }, {
+        preview,
+        ui.label({
+            text = detail,
+            maxLines = 1,
+            fontSize = 11,
+            color = entry.kind == "video" and "secondary" or "on_surface",
+        }),
+    })
+end
+
+local function beginGridBuild(values, connectors)
+    gridGeneration = gridGeneration + 1
+    local generation = gridGeneration
+    gridRows = {}
+    gridBuilding = true
+    gridProgress = 0
+    local index = 1
+    local row = {}
+
+    local processBatch
+    processBatch = function()
+        if generation ~= gridGeneration then
+            return
+        end
+        local last = math.min(#values, index + GRID_BATCH_SIZE - 1)
+        while index <= last do
+            table.insert(row, tileFor(values[index], connectors))
+            if #row == 4 then
+                table.insert(gridRows, ui.row({ gap = 10, align = "start" }, row))
+                row = {}
+            end
+            index = index + 1
+        end
+        gridProgress = #values == 0 and 1 or math.min(1, (index - 1) / #values)
+        if index > #values then
+            if #row > 0 then
+                table.insert(gridRows, ui.row({ gap = 10, align = "start" }, row))
+            end
+            gridBuilding = false
+            render()
+            return
+        end
+        local started = noctalia.runAsync(":", function()
+            processBatch()
+        end, 2000)
+        if not started then
+            gridBuilding = false
+            scanError = "Noctalia command capacity is busy"
+            render()
         end
     end
 
-    local details = {
-        ui.label({ text = entry.name, maxLines = 1, fontSize = 11, fontWeight = "bold", flexGrow = 1 }),
-    }
-    for _, badge in ipairs(badges) do
-        table.insert(details, badge)
-    end
+    processBatch()
+end
 
-    return ui.column(props, {
-        preview,
-        ui.row({ gap = 6, align = "center" }, details),
+local function loadingState(label, progress)
+    local rows = {}
+    for rowIndex = 1, 2 do
+        local cards = {}
+        for cardIndex = 1, 4 do
+            local offset = ((rowIndex - 1) * 4 + cardIndex - 1) * 0.08
+            local opacity = 0.22 + 0.28 * math.abs(math.sin((loadingPulse + offset) * math.pi))
+            table.insert(cards, ui.column({
+                width = 210,
+                height = 128,
+                radius = 10,
+                fill = "surface_variant",
+                opacity = opacity,
+            }))
+        end
+        table.insert(rows, ui.row({ gap = 10 }, cards))
+    end
+    return ui.column({ flexGrow = 1, gap = 10, justify = "center" }, {
+        ui.row({ align = "center", gap = 8 }, {
+            ui.label({ text = label, color = "on_surface_variant", flexGrow = 1 }),
+            ui.label({ text = tostring(math.floor(progress * 100)) .. "%", color = "on_surface_variant", fontSize = 11 }),
+        }),
+        ui.progress({ height = 4, progress = progress, fill = "primary", track = "surface_variant", radius = 2 }),
+        ui.column({ gap = 10 }, rows),
     })
 end
 
 local function folderStrip(directories)
     if #directories == 0 then
+        folderEntries = {}
         return nil
     end
-    local buttons = {}
+    folderEntries = directories
+    local options = { tr("panel.folders") }
     for _, entry in ipairs(directories) do
-        table.insert(buttons, ui.button({
-            key = entry.path,
-            glyph = "folder",
-            text = entry.name,
-            variant = "ghost",
-            onClick = function() navigateDirectory(entry) end,
-        }))
+        table.insert(options, entry.name)
     end
     return ui.row({ align = "center", gap = 8 }, {
-        ui.label({ text = tr("panel.folders"), color = "on_surface_variant", fontSize = 11 }),
-        ui.scroll({ horizontal = true, flexGrow = 1 }, {
-            ui.row({ gap = 6 }, buttons),
+        ui.glyph({ name = "folder", color = "on_surface_variant", size = 18 }),
+        ui.select({
+            options = options,
+            selectedIndex = 0,
+            flexGrow = 1,
+            onChange = "onFolderChanged",
         }),
     })
 end
@@ -632,8 +720,16 @@ local function resultBanner()
 end
 
 render = function()
+    if not scanning and not indexBuilding and viewDirty and not viewBuilding then
+        beginViewBuild()
+    end
     local visible, total, pages, directories = visibleEntries()
     local connectors = connectorNames()
+    if not indexBuilding and not viewBuilding and total > 0 and gridRows == nil and not gridBuilding then
+        beginGridBuild(visible, selectedConnectors())
+    end
+    local loading = scanning or indexBuilding or viewBuilding or gridBuilding
+    panel.setNeedsFrameTick(loading)
     outputOptions = { tr("panel.all_outputs") }
     local selectedIndex = 0
     for index, connector in ipairs(connectors) do
@@ -709,6 +805,13 @@ render = function()
             maxLines = 2,
         }))
     end
+    if (libraryStatus.skipped_invalid_utf8 or 0) > 0 then
+        table.insert(children, ui.label({
+            text = tr("panel.skipped_invalid_utf8", { count = libraryStatus.skipped_invalid_utf8 }),
+            color = "on_surface_variant",
+            fontSize = 11,
+        }))
+    end
 
     local active = activeStrip(connectors)
     if active then table.insert(children, active) end
@@ -716,16 +819,21 @@ render = function()
     if result then table.insert(children, result) end
 
     if scanning then
-        table.insert(children, ui.column({ flexGrow = 1, align = "center", justify = "center", gap = 8 }, {
-            ui.glyph({ name = "loader", size = 32, color = "primary" }),
-            ui.label({ text = tr("panel.scanning"), color = "on_surface_variant" }),
-        }))
+        local consumed = tonumber(libraryStatus.consumed_bytes) or 0
+        local bytes = tonumber(libraryStatus.bytes) or 0
+        table.insert(children, loadingState(tr("panel.scanning"), bytes > 0 and math.min(1, consumed / bytes) or 0))
     elseif scanError and total == 0 then
         table.insert(children, ui.column({ flexGrow = 1, align = "center", justify = "center", gap = 8 }, {
             ui.glyph({ name = "alert-circle", size = 32, color = "error" }),
             ui.label({ text = tr("panel.directory_unreadable"), color = "error", fontWeight = "bold" }),
             ui.label({ text = scanError, color = "on_surface_variant", maxLines = 2 }),
         }))
+    elseif indexBuilding then
+        table.insert(children, loadingState(tr("panel.preparing_library"), indexProgress))
+    elseif viewBuilding then
+        table.insert(children, loadingState(tr("panel.preparing_library"), viewProgress))
+    elseif gridBuilding then
+        table.insert(children, loadingState(tr("panel.preparing_library"), gridProgress))
     elseif total == 0 then
         table.insert(children, ui.column({ flexGrow = 1, align = "center", justify = "center", gap = 8 }, {
             ui.glyph({ name = "photo-off", size = 36, color = "outline" }),
@@ -735,16 +843,31 @@ render = function()
             }),
         }))
     else
-        local rows = {}
-        local row = {}
-        for index, entry in ipairs(visible) do
-            table.insert(row, tileFor(entry, selectedConnectors()))
-            if #row == 4 or index == #visible then
-                table.insert(rows, ui.row({ gap = 10, align = "start" }, row))
-                row = {}
-            end
-        end
-        table.insert(children, ui.column({ gap = 10, flexGrow = 1, align = "stretch" }, rows))
+        table.insert(children, ui.scroll({
+            key = "media:" .. filter .. ":" .. tostring(currentDirectory or "") .. ":" .. tostring(page) .. ":" .. search,
+            gap = 10,
+            flexGrow = 1,
+            align = "stretch",
+        }, gridRows or {}))
+    end
+
+    if libraryStatus.phase == "thumbnails" and (libraryStatus.thumbnails_total or 0) > 0 then
+        local done = tonumber(libraryStatus.thumbnails_done) or 0
+        local thumbnails = tonumber(libraryStatus.thumbnails_total) or 0
+        table.insert(children, ui.column({ gap = 4 }, {
+            ui.label({
+                text = tr("panel.generating_previews", { count = done, total = thumbnails }),
+                color = "on_surface_variant",
+                fontSize = 11,
+            }),
+            ui.progress({
+                height = 3,
+                progress = thumbnails > 0 and math.min(1, done / thumbnails) or 0,
+                fill = "primary",
+                track = "surface_variant",
+                radius = 2,
+            }),
+        }))
     end
 
     table.insert(children, ui.row({ align = "center", gap = 8 }, {
@@ -757,12 +880,14 @@ render = function()
 end
 
 function onOpen(_context)
-    thumbnailsAvailable = noctalia.commandExists("gst-launch-1.0")
     outputs = noctalia.state.get("outputs") or noctalia.outputs() or {}
     assignments = noctalia.state.get("assignments") or {}
     runtime = noctalia.state.get("runtime") or {}
     capabilities = noctalia.state.get("capabilities") or capabilities
-    rescan()
+    libraryStatus = noctalia.state.get("library_status") or libraryStatus
+    scanError = libraryStatus.error
+    scanning = libraryStatus.phase == "scanning"
+    loadLibrary(noctalia.state.get("library") or library)
     render()
 end
 
@@ -777,6 +902,7 @@ end
 function onSearchChanged(value)
     search = tostring(value or "")
     page = 1
+    invalidateView()
     render()
 end
 
@@ -785,7 +911,7 @@ local function setFilter(value)
     currentDirectory = nil
     currentRoot = nil
     page = 1
-    rescan()
+    invalidateView()
     render()
 end
 
@@ -795,7 +921,7 @@ function onFilterVideos() setFilter("videos") end
 
 function onOutputChanged(index, _label)
     selectedOutput = index == 0 and "*" or outputOptions[index + 1] or "*"
-    page = 1
+    invalidateGrid()
     render()
 end
 
@@ -803,16 +929,38 @@ function onNavigateUp() navigateUp() end
 
 function onPreviousPage()
     page = math.max(1, page - 1)
+    invalidateGrid()
     render()
 end
 
 function onNextPage()
     page = page + 1
+    invalidateGrid()
     render()
+end
+
+function onFolderChanged(index, _label)
+    if index > 0 and folderEntries[index] then
+        navigateDirectory(folderEntries[index])
+    end
+end
+
+function onFrameTick(deltaMs)
+    if not scanning and not indexBuilding and not viewBuilding and not gridBuilding then
+        panel.setNeedsFrameTick(false)
+        return
+    end
+    loadingElapsed = loadingElapsed + (tonumber(deltaMs) or 0)
+    if loadingElapsed >= 100 then
+        loadingElapsed = loadingElapsed - 100
+        loadingPulse = (loadingPulse + 0.08) % 1
+        render()
+    end
 end
 
 noctalia.state.watch("assignments", function(value)
     assignments = type(value) == "table" and value or {}
+    invalidateGrid()
     render()
 end)
 noctalia.state.watch("runtime", function(value)
@@ -821,14 +969,33 @@ noctalia.state.watch("runtime", function(value)
 end)
 noctalia.state.watch("capabilities", function(value)
     capabilities = type(value) == "table" and value or capabilities
+    invalidateGrid()
     render()
 end)
 noctalia.state.watch("outputs", function(value)
     outputs = type(value) == "table" and value or {}
+    invalidateGrid()
     render()
 end)
 noctalia.state.watch("command_result", function(value)
     commandResult = value
+    invalidateGrid()
+    render()
+end)
+noctalia.state.watch("library", function(value)
+    if loadLibrary(value) then
+        scanError = libraryStatus.error
+        render()
+    end
+end)
+noctalia.state.watch("library_status", function(value)
+    local previousPhase = libraryStatus.phase
+    libraryStatus = type(value) == "table" and value or libraryStatus
+    scanError = libraryStatus.error
+    scanning = libraryStatus.phase == "scanning"
+    if libraryStatus.phase == "ready" and previousPhase ~= "ready" then
+        invalidateGrid()
+    end
     render()
 end)
 
@@ -841,5 +1008,6 @@ return {
     mixedCounts = mixedCounts,
     videoPlaybackAction = videoPlaybackAction,
     partitionEntries = partitionEntries,
+    paginate = paginate,
     pageSize = PAGE_SIZE,
 }

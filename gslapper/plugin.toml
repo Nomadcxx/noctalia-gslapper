@@ -7,7 +7,7 @@ license = "MIT"
 dependencies = ["gslapper", "socat"]
 tags = ["bar", "panel", "service", "video", "wallpaper"]
 icon = "wallpaper-selector"
-description = "Choose image or video wallpapers independently for each output."
+description = "Choose an image or video wallpaper for each output."
 
 [[setting]]
 key = "video_directory"
@@ -101,7 +101,7 @@ entry = "service.luau"
 id = "picker"
 entry = "panel.luau"
 width = 980
-height = 700
+height = 1100
 placement = "attached"
 position = "auto"
 keyboard_focus = "exclusive"

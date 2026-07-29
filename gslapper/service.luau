@@ -10,6 +10,27 @@ local lastHandledNonce = 0
 local commandBatches = {}
 local activeRequests = {}
 local restartSettingsSignature = ""
+local NOTIFICATION_TITLE = "gSlapper"
+local IMAGE_EXTENSIONS = { jpg = true, jpeg = true, png = true, webp = true, jxl = true, bmp = true }
+local VIDEO_EXTENSIONS = { mp4 = true, mkv = true, webm = true, mov = true, avi = true, m4v = true, gif = true }
+local LIBRARY_BATCH_SIZE = 6
+local THUMBNAIL_LIMIT = 2
+local libraryGeneration = 0
+local libraryVersion = 0
+local libraryTasks = {}
+local librarySources = {}
+local libraryErrors = {}
+local libraryProcessed = 0
+local libraryBytes = 0
+local libraryConsumedBytes = 0
+local libraryInvalidUtf8 = 0
+local thumbnailQueue = {}
+local thumbnailActive = 0
+local thumbnailReady = 0
+local thumbnailDone = 0
+local thumbnailTotal = 0
+local thumbnailsAvailable = false
+local libraryRootSignature = ""
 
 local REQUIRED_FLAGS = {
     "--fork",
@@ -54,6 +75,310 @@ local function shellQuote(value)
         return nil, message
     end
     return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function trimTrailingSlash(path)
+    if type(path) ~= "string" then
+        return nil
+    end
+    path = path:gsub("/+$", "")
+    return path == "" and "/" or path
+end
+
+local function mediaRoots()
+    local image = trimTrailingSlash(noctalia.wallpaperDirectory())
+    local configured = noctalia.getConfig("video_directory")
+    local video = trimTrailingSlash(type(configured) == "string" and noctalia.expandPath(configured) or nil)
+    return image, video
+end
+
+local function validMediaRoot(path)
+    return type(path) == "string" and path:sub(1, 1) == "/" and validateShellValue(path)
+end
+
+local function classifyMedia(name)
+    if type(name) ~= "string" then
+        return nil
+    end
+    local extension = name:match("%.([^./]+)$")
+    extension = extension and extension:lower() or nil
+    if extension == "gif" then
+        return "video"
+    elseif extension and IMAGE_EXTENSIONS[extension] then
+        return "image"
+    elseif extension and VIDEO_EXTENSIONS[extension] then
+        return "video"
+    end
+    return nil
+end
+
+local function fnv1a32(value)
+    -- ponytail: 32-bit FNV keeps cache names short; use a wider digest if a real collision appears.
+    local hash = 2166136261
+    for index = 1, #value do
+        hash = bit32.bxor(hash, value:byte(index))
+        local low = (hash % 65536) * 16777619
+        local high = (math.floor(hash / 65536) * 16777619) % 65536
+        hash = (low + high * 65536) % 4294967296
+    end
+    return string.format("%08x", hash)
+end
+
+local function thumbnailPath(path, size, mtime)
+    local directory = noctalia.pluginDataDir()
+    if not directory then
+        return nil
+    end
+    return directory .. "/thumb-" .. fnv1a32("v3:" .. path .. ":" .. tostring(size) .. ":" .. tostring(mtime)) .. ".jpg"
+end
+
+local function publishLibraryStatus(phase, errorMessage)
+    noctalia.state.set("library_status", {
+        phase = phase,
+        generation = libraryGeneration,
+        version = libraryVersion,
+        processed = libraryProcessed,
+        bytes = libraryBytes,
+        consumed_bytes = libraryConsumedBytes,
+        skipped_invalid_utf8 = libraryInvalidUtf8,
+        thumbnails_ready = thumbnailReady,
+        thumbnails_done = thumbnailDone,
+        thumbnails_total = thumbnailTotal,
+        error = errorMessage,
+    })
+end
+
+local function nextNulField(raw, offset)
+    local boundary = raw:find("\0", offset, true)
+    if not boundary then
+        return nil, offset
+    end
+    return raw:sub(offset, boundary - 1), boundary + 1
+end
+
+local function isWithinRoot(path, root)
+    return path == root or path:sub(1, #root + 1) == root .. "/"
+end
+
+local function acceptsMedia(rootKind, kind, name)
+    if rootKind == "mixed" or rootKind == "video" then
+        return rootKind == "mixed" or kind == "video"
+    end
+    return kind == "image" or name:lower():match("%.gif$") ~= nil
+end
+
+local startThumbnailJobs
+local function finishLibraryIndex(generation)
+    if generation ~= libraryGeneration then
+        return
+    end
+    libraryVersion = libraryVersion + 1
+    local imageRoot, videoRoot = mediaRoots()
+    noctalia.state.set("library", {
+        version = libraryVersion,
+        roots = { image = imageRoot, video = videoRoot },
+        sources = librarySources,
+    })
+    thumbnailTotal = thumbnailReady + #thumbnailQueue
+    thumbnailDone = thumbnailReady
+    if thumbnailTotal == thumbnailReady then
+        publishLibraryStatus("ready", #libraryErrors > 0 and table.concat(libraryErrors, "; ") or nil)
+    else
+        publishLibraryStatus("thumbnails", #libraryErrors > 0 and table.concat(libraryErrors, "; ") or nil)
+        startThumbnailJobs(generation)
+    end
+end
+
+local scheduleLibraryBatch
+local function processLibraryBatch(generation)
+    if generation ~= libraryGeneration then
+        return
+    end
+    local remaining = LIBRARY_BATCH_SIZE
+    while remaining > 0 and #libraryTasks > 0 do
+        local task = libraryTasks[1]
+        local previousOffset = task.offset
+        local fileType
+        fileType, task.offset = nextNulField(task.raw, task.offset)
+        if not fileType then
+            table.remove(libraryTasks, 1)
+        else
+            local size
+            local mtime
+            local path
+            size, task.offset = nextNulField(task.raw, task.offset)
+            mtime, task.offset = nextNulField(task.raw, task.offset)
+            path, task.offset = nextNulField(task.raw, task.offset)
+            libraryConsumedBytes = libraryConsumedBytes + task.offset - previousOffset
+            remaining = remaining - 1
+            libraryProcessed = libraryProcessed + 1
+            if path and utf8.len(path) == nil then
+                libraryInvalidUtf8 = libraryInvalidUtf8 + 1
+            elseif path and validateShellValue(path) and isWithinRoot(path, task.root) then
+                local name = path:match("([^/]+)$")
+                if fileType == "f" then
+                    local kind = classifyMedia(name)
+                    if kind and acceptsMedia(task.rootKind, kind, name) then
+                        local numericSize = tonumber(size) or 0
+                        local numericMtime = tonumber(mtime) or 0
+                        local thumbnail = thumbnailPath(path, numericSize, numericMtime)
+                        local entry = { path = path, thumbnail = thumbnail }
+                        if thumbnail and noctalia.fileExists(thumbnail) then
+                            thumbnailReady = thumbnailReady + 1
+                        elseif thumbnail and thumbnailsAvailable then
+                            table.insert(thumbnailQueue, entry)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if #libraryTasks == 0 then
+        finishLibraryIndex(generation)
+    else
+        publishLibraryStatus("scanning")
+        scheduleLibraryBatch(generation)
+    end
+end
+
+scheduleLibraryBatch = function(generation)
+    local started = noctalia.runAsync(":", function()
+        processLibraryBatch(generation)
+    end, 2000)
+    if not started and generation == libraryGeneration then
+        publishLibraryStatus("error", "Noctalia command capacity is busy")
+    end
+end
+
+startThumbnailJobs = function(generation)
+    while generation == libraryGeneration and thumbnailActive < THUMBNAIL_LIMIT and #thumbnailQueue > 0 do
+        local entry = table.remove(thumbnailQueue, 1)
+        thumbnailActive = thumbnailActive + 1
+        local temporary = entry.thumbnail .. ".tmp-" .. tostring(generation)
+        local command = "gst-launch-1.0 -q filesrc location=" .. shellQuote(entry.path)
+            .. " ! decodebin ! videoconvert ! videoscale"
+            .. " ! video/x-raw,width=224,height=126,pixel-aspect-ratio=1/1"
+            .. " ! jpegenc quality=80 snapshot=true ! filesink location=" .. shellQuote(temporary)
+        local started = noctalia.runAsync(command, function(result)
+            if generation ~= libraryGeneration then
+                noctalia.removeFile(temporary)
+                return
+            end
+            thumbnailActive = thumbnailActive - 1
+            if result.exitCode == 0 and noctalia.fileExists(temporary)
+                and noctalia.renameFile(temporary, entry.thumbnail) then
+                thumbnailReady = thumbnailReady + 1
+            else
+                noctalia.removeFile(temporary)
+            end
+            thumbnailDone = thumbnailDone + 1
+            if #thumbnailQueue == 0 and thumbnailActive == 0 then
+                publishLibraryStatus("ready", #libraryErrors > 0 and table.concat(libraryErrors, "; ") or nil)
+            elseif thumbnailDone % 8 == 0 then
+                publishLibraryStatus("thumbnails", #libraryErrors > 0 and table.concat(libraryErrors, "; ") or nil)
+            end
+            startThumbnailJobs(generation)
+        end, 15000)
+        if not started then
+            thumbnailActive = thumbnailActive - 1
+            thumbnailDone = thumbnailDone + 1
+            if #thumbnailQueue == 0 and thumbnailActive == 0 then
+                publishLibraryStatus("ready", "could not start thumbnail generation")
+            end
+        end
+    end
+end
+
+local function startLibraryIndex()
+    local imageRoot, videoRoot = mediaRoots()
+    local signature = tostring(imageRoot or "") .. "\0" .. tostring(videoRoot or "")
+    libraryRootSignature = signature
+    libraryGeneration = libraryGeneration + 1
+    local generation = libraryGeneration
+    libraryTasks = {}
+    librarySources = {}
+    libraryErrors = {}
+    libraryProcessed = 0
+    libraryBytes = 0
+    libraryConsumedBytes = 0
+    libraryInvalidUtf8 = 0
+    thumbnailQueue = {}
+    thumbnailActive = 0
+    thumbnailReady = 0
+    thumbnailDone = 0
+    thumbnailTotal = 0
+    thumbnailsAvailable = noctalia.commandExists("gst-launch-1.0")
+    publishLibraryStatus("scanning")
+
+    local roots = {}
+    if imageRoot and videoRoot == imageRoot then
+        if validMediaRoot(imageRoot) then
+            table.insert(roots, { root = imageRoot, rootKind = "mixed" })
+        else
+            table.insert(libraryErrors, "Wallpaper directory must be an absolute path without control characters")
+        end
+    else
+        if imageRoot then
+            if validMediaRoot(imageRoot) then
+                table.insert(roots, { root = imageRoot, rootKind = "image" })
+            else
+                table.insert(libraryErrors, "Wallpaper directory must be an absolute path without control characters")
+            end
+        end
+        if videoRoot then
+            if validMediaRoot(videoRoot) then
+                table.insert(roots, { root = videoRoot, rootKind = "video" })
+            else
+                table.insert(libraryErrors, "Video directory must be an absolute path without control characters")
+            end
+        end
+    end
+    if #roots == 0 then
+        publishLibraryStatus("error", #libraryErrors > 0 and table.concat(libraryErrors, "; ")
+            or "No wallpaper directories are configured")
+        return
+    end
+
+    local pendingRoots = #roots
+    for _, root in ipairs(roots) do
+        local quoted = shellQuote(root.root)
+        local command = "find -P " .. quoted .. " -mindepth 1 -printf '%y\\0%s\\0%T@\\0%p\\0'"
+        local started = noctalia.runAsync(command, function(result)
+            if generation ~= libraryGeneration then
+                return
+            end
+            pendingRoots = pendingRoots - 1
+            if result.exitCode == 0 then
+                local raw = result.stdout or ""
+                local indexPath = noctalia.pluginDataDir() .. "/library-" .. root.rootKind .. ".index"
+                noctalia.writeFile(indexPath, raw)
+                libraryBytes = libraryBytes + #raw
+                table.insert(librarySources, {
+                    root = root.root,
+                    rootKind = root.rootKind,
+                    path = indexPath,
+                })
+                table.insert(libraryTasks, {
+                    root = root.root,
+                    rootKind = root.rootKind,
+                    raw = raw,
+                    offset = 1,
+                })
+            else
+                table.insert(libraryErrors, result.stderr ~= "" and result.stderr or (root.root .. " is unreadable"))
+            end
+            if pendingRoots == 0 then
+                scheduleLibraryBatch(generation)
+            end
+        end, 30000)
+        if not started then
+            pendingRoots = pendingRoots - 1
+            table.insert(libraryErrors, "could not scan " .. root.root)
+        end
+    end
+    if pendingRoots == 0 then
+        scheduleLibraryBatch(generation)
+    end
 end
 
 local function runtimeDirectory()
@@ -1107,6 +1432,8 @@ local function runModelChecks()
 
     assert(shellQuote("/tmp/a b's.mp4") == "'/tmp/a b'\\''s.mp4'", "apostrophe quoting failed")
     assert(validateShellValue("line\nbreak") == nil and validateShellValue("nul\0byte") == nil, "control character accepted")
+    assert(validMediaRoot("/wallpapers") and not validMediaRoot("wallpapers")
+        and not validMediaRoot("/wall\npapers"), "media root validation failed")
 
     local testDirectory = "/run/user/1000/noctalia-gslapper"
     local socketPath = socketPathFor("../DP/1", testDirectory)
@@ -1168,16 +1495,16 @@ local function runSelfTest(quiet)
     local ok, message = pcall(runModelChecks)
     local report = {
         passed = ok,
-        checks = 21,
+        checks = 22,
         error = not ok and tostring(message) or nil,
     }
 
     if not quiet then
         publishSelfTest(report)
         if ok then
-            noctalia.notify("gSlapper Wallpaper", "Self-test passed.")
+            noctalia.notify(NOTIFICATION_TITLE, "Self-test passed.")
         else
-            noctalia.notifyError("gSlapper Wallpaper", report.error)
+            noctalia.notifyError(NOTIFICATION_TITLE, report.error)
             error(report.error)
         end
     end
@@ -1259,6 +1586,11 @@ function onConfigChanged()
         restartActiveVideos()
     end
     restartSettingsSignature = currentSignature
+    local imageRoot, videoRoot = mediaRoots()
+    local rootsSignature = tostring(imageRoot or "") .. "\0" .. tostring(videoRoot or "")
+    if noctalia.pluginDataDir() and rootsSignature ~= libraryRootSignature then
+        startLibraryIndex()
+    end
 end
 
 function onExit()
@@ -1328,6 +1660,9 @@ if type(noctalia.commandExists) == "function" then
     restartSettingsSignature = settingsSignature()
     noctalia.state.watch("command", handleCommand)
     probeCapabilities()
+    if noctalia.pluginDataDir() then
+        startLibraryIndex()
+    end
 end
 
 return {
@@ -1357,5 +1692,8 @@ return {
     setPlayback = setPlayback,
     handleCommand = handleCommand,
     runSelfTest = runSelfTest,
+    classifyMedia = classifyMedia,
+    fnv1a32 = fnv1a32,
+    validMediaRoot = validMediaRoot,
     requiredFlags = REQUIRED_FLAGS,
 }
