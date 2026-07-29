@@ -1,20 +1,37 @@
 # gSlapper Wallpaper for Noctalia
 
-This repository provides `nomadcxx/gslapper`, a Noctalia v5 plugin for image
-and video wallpapers. You can assign one wallpaper to every output or choose a
-different file for each connector.
+`nomadcxx/gslapper` adds image and video wallpapers to Noctalia v5. Its combined
+picker can assign one file to every output or a different file to each
+connector.
+
+Video playback uses [gSlapper](https://github.com/Nomadcxx/gSlapper) instead of
+mpvpaper. gSlapper uses GStreamer rather than libmpv; its README documents lower
+CPU, memory, and GPU use than mpvpaper. Tests cover Niri, Hyprland, and Sway.
 
 ![gSlapper wallpaper picker](gslapper/thumbnail.webp)
 
-Install [gSlapper](https://github.com/GhostNaN/gSlapper) 1.5.2 or newer,
-`find`, `gst-launch-1.0`, `pkill`, and `socat`, then add this Git source:
+## Requirements
+
+Install [gSlapper](https://github.com/Nomadcxx/gSlapper) 1.5.2 or newer,
+`find`, `gst-launch-1.0`, `pkill`, and `socat`.
+
+## Install
+
+Add this repository as a custom plugin source in Noctalia:
+
+1. Open **Settings → Plugins → Sources**.
+2. Choose **Add custom repository**.
+3. Enter `https://github.com/Nomadcxx/noctalia-gslapper`.
+4. Open **Settings → Plugins → Install** and select **gSlapper Wallpaper**.
+
+Or install it from a shell:
 
 ```sh
 noctalia msg plugins source add gslapper git https://github.com/Nomadcxx/noctalia-gslapper
+noctalia msg plugins enable nomadcxx/gslapper
 ```
 
-Enable `nomadcxx/gslapper` in Noctalia's plugin settings. See the
-[plugin README](gslapper/README.md) for the exact bar-widget steps,
+See the [plugin README](gslapper/README.md) for the bar-widget steps,
 configuration, commands, and runtime side effects.
 
 Run the panel pagination check from the repository root:
