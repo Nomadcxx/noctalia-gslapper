@@ -1,0 +1,62 @@
+{
+  "panel": {
+    "title": "Wallpaper"
+  },
+  "widget": {
+    "tooltip": "Choose wallpaper"
+  },
+  "settings": {
+    "video_directory": {
+      "label": "Video directory",
+      "description": "Directory containing video wallpapers."
+    },
+    "scale": {
+      "label": "Video scale",
+      "description": "How videos fit the output.",
+      "options": {
+        "fill": "Fill",
+        "stretch": "Stretch",
+        "original": "Original",
+        "panscan": "Panscan"
+      }
+    },
+    "hidden_behavior": {
+      "label": "When hidden",
+      "description": "Playback behavior while the wallpaper is obscured.",
+      "options": {
+        "continue": "Continue",
+        "auto_pause": "Auto-pause",
+        "auto_stop": "Auto-stop"
+      }
+    },
+    "loop": {
+      "label": "Loop videos",
+      "description": "Restart a video when it reaches the end."
+    },
+    "fps_cap": {
+      "label": "FPS cap",
+      "description": "Maximum video wallpaper frame rate.",
+      "options": {
+        "fps_30": "30",
+        "fps_60": "60",
+        "fps_100": "100"
+      }
+    },
+    "fade": {
+      "label": "Fade between videos",
+      "description": "Use a fade when changing media."
+    },
+    "fade_duration": {
+      "label": "Fade duration",
+      "description": "Fade duration in seconds."
+    },
+    "gst_options": {
+      "label": "Additional GStreamer options",
+      "description": "Extra options passed to gSlapper's GStreamer pipeline."
+    },
+    "glyph": {
+      "label": "Widget glyph",
+      "description": "Glyph shown in the bar."
+    }
+  }
+}

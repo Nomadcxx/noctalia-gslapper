@@ -1,0 +1,11 @@
+[[plugin]]
+id = "nomadcxx/gslapper"
+name = "gSlapper Wallpaper"
+version = "0.1.0"
+author = "Nomadcxx"
+license = "MIT"
+icon = "wallpaper-selector"
+description = "Choose image or video wallpapers independently for each output."
+plugin_api = 19
+dependencies = ["gslapper", "socat"]
+tags = ["bar", "panel", "service", "video", "wallpaper"]
