@@ -2,7 +2,7 @@
 
 local IMAGE_EXTENSIONS = { jpg = true, jpeg = true, png = true, webp = true, jxl = true, bmp = true }
 local VIDEO_EXTENSIONS = { mp4 = true, mkv = true, webm = true, mov = true, avi = true, m4v = true, gif = true }
-local PAGE_SIZE = 12
+local PAGE_SIZE = 8
 local THUMBNAIL_LIMIT = 2
 local SCAN_BATCH_SIZE = 12
 
@@ -339,14 +339,22 @@ local function rescan()
     end
 end
 
-local function visibleEntries()
-    local filtered = {}
-    local needle = search:lower()
-    for _, entry in ipairs(entries) do
-        if needle == "" or entry.name:lower():find(needle, 1, true) then
-            table.insert(filtered, entry)
+local function partitionEntries(values, needle)
+    local directories = {}
+    local media = {}
+    needle = tostring(needle or ""):lower()
+    for _, entry in ipairs(values or {}) do
+        if entry.kind == "directory" then
+            table.insert(directories, entry)
+        elseif needle == "" or entry.name:lower():find(needle, 1, true) then
+            table.insert(media, entry)
         end
     end
+    return directories, media
+end
+
+local function visibleEntries()
+    local directories, filtered = partitionEntries(entries, search)
     local pages = math.max(1, math.ceil(#filtered / PAGE_SIZE))
     page = math.max(1, math.min(page, pages))
     local first = (page - 1) * PAGE_SIZE + 1
@@ -357,7 +365,7 @@ local function visibleEntries()
         table.insert(visible, entry)
     end
     startThumbnailJobs()
-    return visible, #filtered, pages
+    return visible, #filtered, pages, directories
 end
 
 local function connectorNames()
@@ -454,19 +462,15 @@ local function tileFor(entry, connectors)
     local videoDisabled = entry.kind == "video" and not capabilities.video
     local busy = selectionBusy()
     local preview
-    if entry.kind == "directory" then
-        preview = ui.column({ height = 108, radius = 8, fill = "surface_variant/0.55", align = "center", justify = "center" }, {
-            ui.glyph({ name = "folder", size = 42, color = "primary" }),
-        })
-    elseif entry.thumbnail and noctalia.fileExists(entry.thumbnail) then
+    if entry.thumbnail and noctalia.fileExists(entry.thumbnail) then
         preview = ui.image({
             path = entry.thumbnail,
-            height = 108,
+            height = 96,
             fit = "cover",
             radius = 8,
         })
     else
-        preview = ui.column({ height = 108, radius = 8, fill = "surface_variant/0.55", align = "center", justify = "center" }, {
+        preview = ui.column({ height = 96, radius = 8, fill = "surface_variant/0.55", align = "center", justify = "center" }, {
             ui.glyph({
                 name = entry.kind == "image" and "photo" or "player-play",
                 size = 36,
@@ -499,18 +503,44 @@ local function tileFor(entry, connectors)
         fill = selected and "primary/0.08" or "surface_variant/0.20",
         opacity = videoDisabled and 0.55 or 1,
     }
-    if entry.kind == "directory" then
-        props.onClick = function() navigateDirectory(entry) end
-    elseif not videoDisabled and not busy then
+    if not videoDisabled and not busy then
         props.onClick = function()
             sendCommand(entry.kind == "image" and "assign-image" or "assign-video", entry)
         end
     end
 
+    local details = {
+        ui.label({ text = entry.name, maxLines = 1, fontSize = 11, fontWeight = "bold", flexGrow = 1 }),
+    }
+    for _, badge in ipairs(badges) do
+        table.insert(details, badge)
+    end
+
     return ui.column(props, {
         preview,
-        ui.label({ text = entry.name, maxLines = 1, maxWidth = 196, fontSize = 11, fontWeight = "bold" }),
-        ui.row({ gap = 6, align = "center" }, badges),
+        ui.row({ gap = 6, align = "center" }, details),
+    })
+end
+
+local function folderStrip(directories)
+    if #directories == 0 then
+        return nil
+    end
+    local buttons = {}
+    for _, entry in ipairs(directories) do
+        table.insert(buttons, ui.button({
+            key = entry.path,
+            glyph = "folder",
+            text = entry.name,
+            variant = "ghost",
+            onClick = function() navigateDirectory(entry) end,
+        }))
+    end
+    return ui.row({ align = "center", gap = 8 }, {
+        ui.label({ text = tr("panel.folders"), color = "on_surface_variant", fontSize = 11 }),
+        ui.scroll({ horizontal = true, flexGrow = 1 }, {
+            ui.row({ gap = 6 }, buttons),
+        }),
     })
 end
 
@@ -602,7 +632,7 @@ local function resultBanner()
 end
 
 render = function()
-    local visible, total, pages = visibleEntries()
+    local visible, total, pages, directories = visibleEntries()
     local connectors = connectorNames()
     outputOptions = { tr("panel.all_outputs") }
     local selectedIndex = 0
@@ -652,6 +682,9 @@ render = function()
             }),
         }),
     }
+
+    local folders = folderStrip(directories)
+    if folders then table.insert(children, folders) end
 
     if capabilities.checking then
         table.insert(children, ui.label({ text = tr("panel.checking_dependencies"), color = "on_surface_variant" }))
@@ -711,7 +744,7 @@ render = function()
                 row = {}
             end
         end
-        table.insert(children, ui.scroll({ gap = 10, flexGrow = 1, align = "stretch" }, rows))
+        table.insert(children, ui.column({ gap = 10, flexGrow = 1, align = "stretch" }, rows))
     end
 
     table.insert(children, ui.row({ align = "center", gap = 8 }, {
@@ -807,4 +840,6 @@ return {
     assignmentMatchCount = assignmentMatchCount,
     mixedCounts = mixedCounts,
     videoPlaybackAction = videoPlaybackAction,
+    partitionEntries = partitionEntries,
+    pageSize = PAGE_SIZE,
 }
