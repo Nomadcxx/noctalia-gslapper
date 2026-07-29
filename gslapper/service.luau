@@ -18,6 +18,7 @@ local REQUIRED_FLAGS = {
     "--auto-pause",
     "--auto-stop",
     "--fps-cap",
+    "--gst-options",
     "--transition-type",
     "--transition-duration",
 }
@@ -731,7 +732,9 @@ stopOwned = function(connector, generation, after)
     local directory = runtimeDirectory()
     local socketPath = directory and socketPathFor(connector, directory)
     if not socketPath or not noctalia.fileExists(socketPath) then
-        if after then
+        if socketPath then
+            processFallback(connector, generation, socketPath, after)
+        elseif after then
             after()
         end
         return
@@ -815,13 +818,21 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
                 if isOwnedSocket(socketPath, directory) then
                     noctalia.removeFile(socketPath)
                 end
-                launchVideo(connector, generation, assignment)
+                processFallback(connector, generation, socketPath, function()
+                    launchVideo(connector, generation, assignment)
+                end)
             else
                 setLiveError(connector, generation, query.error)
             end
         end)
     else
-        launchVideo(connector, generation, assignment)
+        if socketPath then
+            processFallback(connector, generation, socketPath, function()
+                launchVideo(connector, generation, assignment)
+            end)
+        else
+            launchVideo(connector, generation, assignment)
+        end
     end
     return true
 end
@@ -1346,4 +1357,5 @@ return {
     setPlayback = setPlayback,
     handleCommand = handleCommand,
     runSelfTest = runSelfTest,
+    requiredFlags = REQUIRED_FLAGS,
 }

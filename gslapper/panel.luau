@@ -3,7 +3,8 @@
 local IMAGE_EXTENSIONS = { jpg = true, jpeg = true, png = true, webp = true, jxl = true, bmp = true }
 local VIDEO_EXTENSIONS = { mp4 = true, mkv = true, webm = true, mov = true, avi = true, m4v = true, gif = true }
 local PAGE_SIZE = 12
-local THUMBNAIL_LIMIT = 4
+local THUMBNAIL_LIMIT = 2
+local SCAN_BATCH_SIZE = 12
 
 local filter = "all"
 local search = ""
@@ -16,6 +17,10 @@ local thumbnailJobs = {}
 local thumbnailQueue = {}
 local thumbnailActive = 0
 local thumbnailsAvailable = false
+local scanTasks = {}
+local scanMessages = {}
+local scanning = false
+local scanGeneration = 0
 local assignments = noctalia.state.get("assignments") or {}
 local runtime = noctalia.state.get("runtime") or {}
 local capabilities = noctalia.state.get("capabilities") or { video = false, checking = true }
@@ -112,6 +117,19 @@ local function mixedCounts(values, connectors)
     return counts
 end
 
+local function videoPlaybackAction(values, liveState, connectors)
+    local videoCount = 0
+    for _, connector in ipairs(connectors or {}) do
+        if values[connector] and values[connector].kind == "video" then
+            videoCount = videoCount + 1
+            if not liveState[connector] or liveState[connector].status ~= "paused" then
+                return "pause"
+            end
+        end
+    end
+    return videoCount > 0 and "resume" or "pause"
+end
+
 local function fnv1a32(value)
     local hash = 2166136261
     for index = 1, #value do
@@ -135,28 +153,29 @@ local function thumbnailPath(path, info)
     if not directory then
         return nil
     end
-    local fingerprint = path .. ":" .. tostring(info.size or 0) .. ":" .. tostring(info.mtime or 0)
+    local fingerprint = "v2:" .. path .. ":" .. tostring(info.size or 0) .. ":" .. tostring(info.mtime or 0)
     return directory .. "/thumb-" .. fnv1a32(fingerprint) .. ".png"
 end
 
 local function startThumbnailJobs()
     while thumbnailsAvailable and thumbnailActive < THUMBNAIL_LIMIT and #thumbnailQueue > 0 do
         local job = table.remove(thumbnailQueue, 1)
-        if thumbnailJobs[job.path] == "queued" then
-            thumbnailJobs[job.path] = "running"
+        if thumbnailJobs[job.key] == "queued" then
+            thumbnailJobs[job.key] = "running"
             thumbnailActive = thumbnailActive + 1
             local temporary = job.thumbnail .. ".tmp"
             local command = "gst-launch-1.0 -q filesrc location=" .. shellQuote(job.path)
-                .. " ! decodebin ! videoconvert ! videoscale ! video/x-raw,width=320"
+                .. " ! decodebin ! videoconvert ! videoscale"
+                .. " ! video/x-raw,width=320,height=180,pixel-aspect-ratio=1/1"
                 .. " ! pngenc snapshot=true ! filesink location=" .. shellQuote(temporary)
             local started = noctalia.runAsync(command, function(result)
                 thumbnailActive = thumbnailActive - 1
                 if result.exitCode == 0 and noctalia.fileExists(temporary) then
                     local renamed = noctalia.renameFile(temporary, job.thumbnail)
-                    thumbnailJobs[job.path] = renamed and "ready" or "failed"
+                    thumbnailJobs[job.key] = renamed and "ready" or "failed"
                 else
                     noctalia.removeFile(temporary)
-                    thumbnailJobs[job.path] = "failed"
+                    thumbnailJobs[job.key] = "failed"
                 end
                 startThumbnailJobs()
                 if render then
@@ -165,96 +184,159 @@ local function startThumbnailJobs()
             end, 15000)
             if not started then
                 thumbnailActive = thumbnailActive - 1
-                thumbnailJobs[job.path] = "failed"
+                thumbnailJobs[job.key] = "failed"
             end
         end
     end
 end
 
 local function queueThumbnail(entry)
-    if not thumbnailsAvailable or entry.kind ~= "video" then
+    if not thumbnailsAvailable or entry.kind == "directory" then
         return
     end
-    local info = noctalia.fileInfo(entry.path)
+    local info = entry.info or noctalia.fileInfo(entry.path)
     if not info or info.isDir then
         return
     end
     local cached = thumbnailPath(entry.path, info)
     entry.thumbnail = cached
     if cached and noctalia.fileExists(cached) then
-        thumbnailJobs[entry.path] = "ready"
-    elseif cached and not thumbnailJobs[entry.path] then
-        thumbnailJobs[entry.path] = "queued"
-        table.insert(thumbnailQueue, { path = entry.path, thumbnail = cached })
+        thumbnailJobs[cached] = "ready"
+    elseif cached and (not thumbnailJobs[cached] or thumbnailJobs[cached] == "failed") then
+        thumbnailJobs[cached] = "queued"
+        table.insert(thumbnailQueue, { key = cached, path = entry.path, thumbnail = cached })
     end
 end
 
-local function scanDirectory(rootKind, root, directory, accepted)
+local function queueDirectoryScan(rootKind, root, directory, accepted)
     local names, message = noctalia.listDir(directory)
     if not names then
         return false, message or "directory is unreadable"
     end
-    for _, name in ipairs(names) do
-        local path = safeChild(root, directory, name)
-        if path then
-            local info = noctalia.fileInfo(path)
-            if info and info.isDir then
-                table.insert(entries, {
-                    name = name,
-                    path = path,
-                    kind = "directory",
-                    root = root,
-                    rootKind = rootKind,
-                })
-            elseif info then
-                local kind = classifyName(name)
-                local allowedVideo = rootKind ~= "image" or name:lower():match("%.gif$") ~= nil
-                if kind and accepted[kind] and (kind ~= "video" or allowedVideo) then
-                    local entry = { name = name, path = path, kind = kind, root = root, rootKind = rootKind }
-                    queueThumbnail(entry)
-                    table.insert(entries, entry)
+    table.insert(scanTasks, {
+        rootKind = rootKind,
+        root = root,
+        directory = directory,
+        accepted = accepted,
+        names = names,
+        index = 1,
+    })
+    return true
+end
+
+local function finishScan()
+    scanning = false
+    scanError = #scanMessages > 0 and table.concat(scanMessages, "; ") or nil
+    sortEntries(entries)
+    page = math.max(1, math.min(page, math.max(1, math.ceil(#entries / PAGE_SIZE))))
+    render()
+end
+
+local scheduleScanBatch
+local function processScanBatch(generation)
+    if generation ~= scanGeneration then
+        return
+    end
+    local remaining = SCAN_BATCH_SIZE
+    while remaining > 0 and #scanTasks > 0 do
+        local task = scanTasks[1]
+        local name = task.names[task.index]
+        if name == nil then
+            table.remove(scanTasks, 1)
+        else
+            task.index = task.index + 1
+            remaining = remaining - 1
+            local path = safeChild(task.root, task.directory, name)
+            if path then
+                local info = noctalia.fileInfo(path)
+                if info and info.isDir then
+                    table.insert(entries, {
+                        name = name,
+                        path = path,
+                        kind = "directory",
+                        root = task.root,
+                        rootKind = task.rootKind,
+                    })
+                elseif info then
+                    local kind = classifyName(name)
+                    local allowedVideo = task.rootKind ~= "image" or name:lower():match("%.gif$") ~= nil
+                    if kind and task.accepted[kind] and (kind ~= "video" or allowedVideo) then
+                        table.insert(entries, {
+                            name = name,
+                            path = path,
+                            kind = kind,
+                            root = task.root,
+                            rootKind = task.rootKind,
+                            info = info,
+                        })
+                    end
                 end
             end
         end
     end
-    return true
+    if #scanTasks == 0 then
+        finishScan()
+    else
+        scheduleScanBatch(generation)
+    end
+end
+
+scheduleScanBatch = function(generation)
+    local started = noctalia.runAsync(":", function()
+        processScanBatch(generation)
+    end, 2000)
+    if not started and generation == scanGeneration then
+        scanning = false
+        scanError = "Noctalia command capacity is busy"
+        render()
+    end
 end
 
 local function rescan()
     entries = {}
     scanError = nil
+    scanTasks = {}
+    scanMessages = {}
+    scanning = true
+    scanGeneration = scanGeneration + 1
+    local generation = scanGeneration
     local imageRoot, videoRoot = roots()
-    local ok = true
-    local messages = {}
 
     if currentDirectory then
         local accepted = filter == "images" and { image = true }
             or filter == "videos" and { video = true }
             or { image = true, video = true }
-        local scanned, message = scanDirectory(currentRoot.kind, currentRoot.path, currentDirectory, accepted)
-        ok = scanned
+        local scanned, message = queueDirectoryScan(currentRoot.kind, currentRoot.path, currentDirectory, accepted)
         if not scanned then
-            table.insert(messages, message)
+            table.insert(scanMessages, message)
         end
     else
-        if filter ~= "videos" and imageRoot then
-            local scanned, message = scanDirectory("image", imageRoot, imageRoot, { image = true, video = true })
-            ok = ok and scanned
-            if not scanned then table.insert(messages, message) end
-        end
-        if filter ~= "images" and videoRoot and videoRoot ~= imageRoot then
-            local scanned, message = scanDirectory("video", videoRoot, videoRoot, { video = true })
-            ok = ok and scanned
-            if not scanned then table.insert(messages, message) end
+        if imageRoot and videoRoot == imageRoot then
+            local accepted = filter == "images" and { image = true }
+                or filter == "videos" and { video = true }
+                or { image = true, video = true }
+            local scanned, message = queueDirectoryScan("video", imageRoot, imageRoot, accepted)
+            if not scanned then table.insert(scanMessages, message) end
+        else
+            if imageRoot then
+                local accepted = filter == "images" and { image = true }
+                    or filter == "videos" and { video = true }
+                    or { image = true, video = true }
+                local scanned, message = queueDirectoryScan("image", imageRoot, imageRoot, accepted)
+                if not scanned then table.insert(scanMessages, message) end
+            end
+            if filter ~= "images" and videoRoot then
+                local scanned, message = queueDirectoryScan("video", videoRoot, videoRoot, { video = true })
+                if not scanned then table.insert(scanMessages, message) end
+            end
         end
     end
 
-    if not ok then
-        scanError = table.concat(messages, "; ")
+    if #scanTasks == 0 then
+        finishScan()
+    else
+        scheduleScanBatch(generation)
     end
-    sortEntries(entries)
-    page = math.max(1, math.min(page, math.max(1, math.ceil(#entries / PAGE_SIZE))))
-    startThumbnailJobs()
 end
 
 local function visibleEntries()
@@ -270,8 +352,11 @@ local function visibleEntries()
     local first = (page - 1) * PAGE_SIZE + 1
     local visible = {}
     for index = first, math.min(#filtered, first + PAGE_SIZE - 1) do
-        table.insert(visible, filtered[index])
+        local entry = filtered[index]
+        queueThumbnail(entry)
+        table.insert(visible, entry)
     end
+    startThumbnailJobs()
     return visible, #filtered, pages
 end
 
@@ -373,16 +458,20 @@ local function tileFor(entry, connectors)
         preview = ui.column({ height = 108, radius = 8, fill = "surface_variant/0.55", align = "center", justify = "center" }, {
             ui.glyph({ name = "folder", size = 42, color = "primary" }),
         })
-    elseif entry.kind == "image" or (entry.thumbnail and noctalia.fileExists(entry.thumbnail)) then
+    elseif entry.thumbnail and noctalia.fileExists(entry.thumbnail) then
         preview = ui.image({
-            path = entry.kind == "image" and entry.path or entry.thumbnail,
+            path = entry.thumbnail,
             height = 108,
             fit = "cover",
             radius = 8,
         })
     else
         preview = ui.column({ height = 108, radius = 8, fill = "surface_variant/0.55", align = "center", justify = "center" }, {
-            ui.glyph({ name = "player-play", size = 36, color = videoDisabled and "outline" or "secondary" }),
+            ui.glyph({
+                name = entry.kind == "image" and "photo" or "player-play",
+                size = 36,
+                color = videoDisabled and "outline" or (entry.kind == "image" and "primary" or "secondary"),
+            }),
         })
     end
 
@@ -428,6 +517,7 @@ end
 local function activeStrip(connectors)
     if selectedOutput == "*" then
         local counts = mixedCounts(assignments, connectors)
+        local playbackAction = videoPlaybackAction(assignments, runtime, connectors)
         return ui.row({ align = "center", gap = 8, padding = 9, radius = 9, fill = "surface_variant/0.40" }, {
             ui.glyph({ name = "devices", color = "primary", size = 18 }),
             ui.label({
@@ -440,10 +530,10 @@ local function activeStrip(connectors)
                 maxLines = 1,
             }),
             ui.button({
-                text = tr("panel.pause_videos"),
+                text = tr(playbackAction == "resume" and "panel.resume_videos" or "panel.pause_videos"),
                 variant = "ghost",
                 enabled = counts.video > 0 and not selectionBusy(),
-                onClick = function() sendCommand("pause") end,
+                onClick = function() sendCommand(playbackAction) end,
             }),
             ui.button({
                 text = tr("panel.restore_all"),
@@ -579,12 +669,25 @@ render = function()
         }))
     end
 
+    if scanError and total > 0 then
+        table.insert(children, ui.label({
+            text = tr("panel.directory_unreadable") .. ": " .. scanError,
+            color = "error",
+            maxLines = 2,
+        }))
+    end
+
     local active = activeStrip(connectors)
     if active then table.insert(children, active) end
     local result = resultBanner()
     if result then table.insert(children, result) end
 
-    if scanError then
+    if scanning then
+        table.insert(children, ui.column({ flexGrow = 1, align = "center", justify = "center", gap = 8 }, {
+            ui.glyph({ name = "loader", size = 32, color = "primary" }),
+            ui.label({ text = tr("panel.scanning"), color = "on_surface_variant" }),
+        }))
+    elseif scanError and total == 0 then
         table.insert(children, ui.column({ flexGrow = 1, align = "center", justify = "center", gap = 8 }, {
             ui.glyph({ name = "alert-circle", size = 32, color = "error" }),
             ui.label({ text = tr("panel.directory_unreadable"), color = "error", fontWeight = "bold" }),
@@ -703,4 +806,5 @@ return {
     fnv1a32 = fnv1a32,
     assignmentMatchCount = assignmentMatchCount,
     mixedCounts = mixedCounts,
+    videoPlaybackAction = videoPlaybackAction,
 }
