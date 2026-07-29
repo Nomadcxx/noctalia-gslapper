@@ -1169,7 +1169,7 @@ local function runSelfTest(quiet)
     local report = {
         passed = ok,
         checks = 21,
-        error = ok and nil or tostring(message),
+        error = not ok and tostring(message) or nil,
     }
 
     if not quiet then
