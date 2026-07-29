@@ -238,6 +238,22 @@ local function connectorSet(connectors)
     return result
 end
 
+local function ownedConnectors(durable, liveState)
+    local seen = {}
+    local connectors = {}
+    for connector in pairs(durable or {}) do
+        seen[connector] = true
+        table.insert(connectors, connector)
+    end
+    for connector in pairs(liveState or {}) do
+        if not seen[connector] then
+            table.insert(connectors, connector)
+        end
+    end
+    table.sort(connectors)
+    return connectors
+end
+
 local function reconcileOutputs(previousConnectors, currentConnectors, durable, live)
     local previous = connectorSet(previousConnectors)
     local current = connectorSet(currentConnectors)
@@ -1123,6 +1139,7 @@ local function runModelChecks()
         ["eDP-1"] = { kind = "video" },
     })
     assert(table.concat(pauseTargets, ",") == "DP-1,eDP-1", "All pause targeted non-video outputs")
+    assert(table.concat(ownedConnectors({ ["DP-1"] = {} }, { ["DP-3"] = {} }), ",") == "DP-1,DP-3", "teardown omitted durable output")
 end
 
 local function publishSelfTest(report)
@@ -1140,7 +1157,7 @@ local function runSelfTest(quiet)
     local ok, message = pcall(runModelChecks)
     local report = {
         passed = ok,
-        checks = 20,
+        checks = 21,
         error = ok and nil or tostring(message),
     }
 
@@ -1238,7 +1255,8 @@ function onExit()
     if not directory then
         return
     end
-    for connector, live in pairs(runtime) do
+    for _, connector in ipairs(ownedConnectors(assignments, runtime)) do
+        local live = runtime[connector] or {}
         noctalia.setWallpaperEnabled(connector, true)
         local socketPath = live.socket_path or socketPathFor(connector, directory)
         if isOwnedSocket(socketPath, directory) and noctalia.fileExists(socketPath) then
@@ -1310,6 +1328,7 @@ return {
     nextGeneration = nextGeneration,
     isCurrent = isCurrent,
     reconcileOutputs = reconcileOutputs,
+    ownedConnectors = ownedConnectors,
     validateAssignment = validateAssignment,
     saveAssignments = saveAssignments,
     validateShellValue = validateShellValue,
