@@ -1,7 +1,7 @@
 [[plugin]]
 id = "nomadcxx/gslapper"
 name = "gSlapper Wallpaper"
-version = "0.1.0"
+version = "0.1.1"
 author = "Nomadcxx"
 license = "MIT"
 icon = "wallpaper-selector"
