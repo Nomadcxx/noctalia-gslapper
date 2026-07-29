@@ -1,6 +1,8 @@
 {
   "panel": {
-    "title": "Wallpaper"
+    "title": "Wallpaper",
+    "media_count": "{count} items",
+    "thumbnail_unavailable": "Video preview unavailable"
   },
   "widget": {
     "tooltip": "Choose wallpaper"
