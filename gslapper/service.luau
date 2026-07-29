@@ -5,6 +5,11 @@ local runtime = {}
 local generations = {}
 local pending = {}
 local capabilities = { video = false, checking = true }
+local previousConnectors = {}
+local lastHandledNonce = 0
+local commandBatches = {}
+local activeRequests = {}
+local restartSettingsSignature = ""
 
 local REQUIRED_FLAGS = {
     "--fork",
@@ -109,6 +114,50 @@ local function parseIpcResponse(command, raw)
     end
 
     return { ok = false, error = raw ~= "" and raw or "gSlapper returned no response", raw = raw }
+end
+
+local COMMAND_ACTIONS = {
+    ["assign-image"] = true,
+    ["assign-video"] = true,
+    ["pause"] = true,
+    ["resume"] = true,
+    ["restore"] = true,
+    ["restore-all"] = true,
+    ["self-test"] = true,
+}
+
+local function validateCommand(command)
+    if type(command) ~= "table" or type(command.nonce) ~= "number" or command.nonce % 1 ~= 0 then
+        return false, "command nonce must be an integer"
+    end
+    if not COMMAND_ACTIONS[command.action] then
+        return false, "unknown command action"
+    end
+    if type(command.target) ~= "string" or command.target == "" then
+        return false, "command target is required"
+    end
+    if command.action == "assign-image" or command.action == "assign-video" then
+        if type(command.path) ~= "string" or command.path:sub(1, 1) ~= "/" or command.path == "/"
+            or not validateShellValue(command.path) then
+            return false, "assignment path must be absolute"
+        end
+    end
+    return true
+end
+
+local function summarizeResults(results)
+    local summary = { total = 0, successful = 0, failed = 0, pending = 0 }
+    for _, result in pairs(results or {}) do
+        summary.total = summary.total + 1
+        if result.pending then
+            summary.pending = summary.pending + 1
+        elseif result.ok then
+            summary.successful = summary.successful + 1
+        else
+            summary.failed = summary.failed + 1
+        end
+    end
+    return summary
 end
 
 local function targetsFor(target, connectors)
@@ -307,6 +356,37 @@ local function publishRuntime()
     noctalia.state.set("runtime", runtime)
 end
 
+local function publishAssignments()
+    noctalia.state.set("assignments", assignments)
+end
+
+local function publishBatch(batch)
+    local record = {
+        nonce = batch.nonce,
+        action = batch.action,
+        results = batch.results,
+        summary = summarizeResults(batch.results),
+    }
+    noctalia.state.set("command_result", record)
+end
+
+local function completeRequest(connector, ok, message)
+    local request = activeRequests[connector]
+    if not request then
+        return
+    end
+    activeRequests[connector] = nil
+    local batch = commandBatches[request.nonce]
+    if not batch then
+        return
+    end
+    batch.results[connector] = { ok = ok, error = ok and nil or message }
+    publishBatch(batch)
+    if summarizeResults(batch.results).pending == 0 then
+        commandBatches[request.nonce] = nil
+    end
+end
+
 local function setPending(connector, operation)
     pending[connector] = operation
     noctalia.setUpdateInterval(100)
@@ -456,6 +536,7 @@ local function setConnectorError(connector, generation, message)
     runtime[connector] = { status = "error", error = message }
     noctalia.setWallpaperEnabled(connector, true)
     publishRuntime()
+    completeRequest(connector, false, message)
 end
 
 local function setLiveError(connector, generation, message)
@@ -470,6 +551,7 @@ local function setLiveError(connector, generation, message)
         socket_path = live.socket_path,
     }
     publishRuntime()
+    completeRequest(connector, false, message)
 end
 
 local stopOwned
@@ -480,6 +562,22 @@ local function commitVideo(connector, generation, assignment, query)
     end
     if not query.ok or query.kind ~= "video" or query.path ~= assignment.path then
         setConnectorError(connector, generation, query.error or "gSlapper reported unexpected media")
+        return
+    end
+    if assignment.desired_playback == "paused" and query.status ~= "paused" then
+        local live = runtime[connector]
+        ipcCommand(live.socket_path, "pause", function(paused)
+            if not isCurrent(connector, generation) then
+                return
+            end
+            if not paused.ok then
+                setConnectorError(connector, generation, paused.error)
+                return
+            end
+            ipcCommand(live.socket_path, "query", function(pausedQuery)
+                commitVideo(connector, generation, assignment, pausedQuery)
+            end)
+        end)
         return
     end
 
@@ -500,7 +598,9 @@ local function commitVideo(connector, generation, assignment, query)
         error = nil,
         socket_path = runtime[connector] and runtime[connector].socket_path,
     }
+    publishAssignments()
     publishRuntime()
+    completeRequest(connector, true)
 end
 
 local function awaitVideo(connector, generation, assignment, socketPath)
@@ -639,7 +739,7 @@ local function changeVideo(connector, generation, assignment, socketPath)
     end)
 end
 
-local function assignVideo(connector, path, previewPath)
+local function assignVideo(connector, path, previewPath, desiredPlayback)
     if not connectorDetected(connector) then
         return false, "output is not connected"
     end
@@ -662,7 +762,7 @@ local function assignVideo(connector, path, previewPath)
         kind = "video",
         path = validPath,
         preview_path = previewPath,
-        desired_playback = "playing",
+        desired_playback = desiredPlayback == "paused" and "paused" or "playing",
     }
     if previewPath then
         noctalia.setWallpaper(connector, previewPath)
@@ -724,8 +824,10 @@ local function assignImage(connector, path)
 
     noctalia.setWallpaperEnabled(connector, true)
     runtime[connector] = { status = "static" }
+    publishAssignments()
     publishRuntime()
     stopOwned(connector, generation)
+    completeRequest(connector, true)
     return true
 end
 
@@ -767,21 +869,130 @@ local function setPlayback(connector, desired)
                 return
             end
             runtime[connector].status = query.status
+            publishAssignments()
             publishRuntime()
+            completeRequest(connector, true)
         end)
     end)
     return true
 end
 
+local function restoreConnector(connector)
+    if not connectorDetected(connector) then
+        return false, "output is not connected"
+    end
+    if connectorBusy(connector) then
+        return false, "output switch is already in progress"
+    end
+
+    local generation = nextGeneration(connector)
+    local previous = assignments[connector]
+    assignments[connector] = nil
+    local saved, saveError = saveAssignments()
+    if not saved then
+        assignments[connector] = previous
+        return false, saveError
+    end
+
+    noctalia.setWallpaperEnabled(connector, true)
+    runtime[connector] = { status = "static" }
+    publishAssignments()
+    publishRuntime()
+    stopOwned(connector, generation, function()
+        completeRequest(connector, true)
+    end)
+    return true
+end
+
+local function restoreAssignment(connector)
+    local assignment = assignments[connector]
+    if not assignment then
+        return
+    end
+    if assignment.kind == "image" then
+        runtime[connector] = { status = "static" }
+        noctalia.setWallpaperEnabled(connector, true)
+        publishRuntime()
+    elseif capabilities.video then
+        assignVideo(connector, assignment.path, assignment.preview_path, assignment.desired_playback)
+    else
+        runtime[connector] = { status = "error", error = capabilities.error or "video support is unavailable" }
+        noctalia.setWallpaperEnabled(connector, true)
+        publishRuntime()
+    end
+end
+
+local function restoreConnectedAssignments()
+    previousConnectors = detectedConnectors()
+    noctalia.state.set("outputs", previousConnectors)
+    for _, connector in ipairs(previousConnectors) do
+        restoreAssignment(connector)
+    end
+end
+
+local function settingsSignature()
+    local settings = normalizedSettings()
+    return table.concat({
+        settings.scale,
+        settings.hidden,
+        tostring(settings.loop),
+        settings.fps,
+        tostring(settings.fade),
+        tostring(settings.fadeDuration),
+        settings.gstOptions,
+    }, "\0")
+end
+
+local function restartActiveVideos()
+    for _, connector in ipairs(detectedConnectors()) do
+        local assignment = assignments[connector]
+        local live = runtime[connector]
+        if assignment and assignment.kind == "video" and live and not connectorBusy(connector) then
+            local generation = nextGeneration(connector)
+            live.status = "starting"
+            live.error = nil
+            publishRuntime()
+            stopOwned(connector, generation, function()
+                launchVideo(connector, generation, copyTable(assignment))
+            end)
+        end
+    end
+end
+
+local function reconcileDetectedOutputs()
+    local current = detectedConnectors()
+    local stops, restores = reconcileOutputs(previousConnectors, current, assignments, runtime)
+    previousConnectors = current
+    noctalia.state.set("outputs", current)
+
+    for _, connector in ipairs(stops) do
+        completeRequest(connector, false, "output disconnected")
+        local generation = nextGeneration(connector)
+        noctalia.setWallpaperEnabled(connector, true)
+        stopOwned(connector, generation)
+    end
+    for _, connector in ipairs(restores) do
+        restoreAssignment(connector)
+    end
+    publishRuntime()
+end
+
+local capabilitiesReady
 local function probeCapabilities()
     if not noctalia.commandExists("gslapper") then
         capabilities = { video = false, checking = false, error = "gSlapper is not installed" }
         noctalia.state.set("capabilities", capabilities)
+        if capabilitiesReady then
+            capabilitiesReady()
+        end
         return
     end
     if not noctalia.commandExists("socat") then
         capabilities = { video = false, checking = false, error = "socat is not installed" }
         noctalia.state.set("capabilities", capabilities)
+        if capabilitiesReady then
+            capabilitiesReady()
+        end
         return
     end
 
@@ -804,10 +1015,16 @@ local function probeCapabilities()
             }
         end
         noctalia.state.set("capabilities", capabilities)
+        if capabilitiesReady then
+            capabilitiesReady()
+        end
     end, 2000)
     if not started then
         capabilities = { video = false, checking = false, error = "could not run the gSlapper compatibility check" }
         noctalia.state.set("capabilities", capabilities)
+        if capabilitiesReady then
+            capabilitiesReady()
+        end
     end
 end
 
@@ -863,6 +1080,28 @@ local function runModelChecks()
     assert(query.ok and query.status == "paused" and query.path == "/tmp/a b.mp4", "query response parsing failed")
     assert(parseIpcResponse("pause", "OK\n").ok, "success response parsing failed")
     assert(parseIpcResponse("change", VIDEO_CHANGE_RESTART_ERROR .. "\n").restart, "video-change recovery parsing failed")
+
+    assert(validateCommand({ nonce = 1, action = "assign-video", target = "*", path = "/tmp/a.mp4" }), "valid command rejected")
+    assert(not validateCommand({ nonce = 1, action = "unknown", target = "*" }), "unknown command accepted")
+    assert(not validateCommand({ nonce = 1, action = "assign-video", target = "*", path = "relative.mp4" }), "relative path accepted")
+
+    local summary = summarizeResults({
+        ["DP-1"] = { ok = true },
+        ["DP-3"] = { ok = false, error = "fixture" },
+        ["eDP-1"] = { pending = true },
+    })
+    assert(summary.total == 3 and summary.successful == 1 and summary.failed == 1 and summary.pending == 1, "batch summary failed")
+
+    local newOutputDurable = { ["DP-1"] = durable["DP-1"] }
+    local _, newOutputRestores = reconcileOutputs({ "DP-1" }, { "DP-1", "DP-3" }, newOutputDurable, {})
+    assert(#newOutputRestores == 0, "unassigned new output received a video")
+
+    local allThenOne = {}
+    applyAssignmentBatch("*", connectors, durable["DP-1"], allThenOne, function()
+        return true
+    end)
+    allThenOne["DP-1"] = copyTable(durable["eDP-1"])
+    assert(allThenOne["DP-3"].kind == "video" and allThenOne["eDP-1"].kind == "video", "individual override changed other outputs")
 end
 
 local function publishSelfTest(report)
@@ -880,7 +1119,7 @@ local function runSelfTest(quiet)
     local ok, message = pcall(runModelChecks)
     local report = {
         passed = ok,
-        checks = 13,
+        checks = 19,
         error = ok and nil or tostring(message),
     }
 
@@ -896,9 +1135,95 @@ local function runSelfTest(quiet)
     return report
 end
 
+local function handleCommand(command)
+    local valid, validationError = validateCommand(command)
+    if not valid or command.nonce <= lastHandledNonce then
+        return false, validationError or "command nonce was already handled"
+    end
+    lastHandledNonce = command.nonce
+
+    if command.action == "self-test" then
+        local report = runSelfTest(true)
+        noctalia.state.set("command_result", {
+            nonce = command.nonce,
+            action = command.action,
+            results = { self_test = { ok = report.passed, error = report.error } },
+            summary = { total = 1, successful = report.passed and 1 or 0, failed = report.passed and 0 or 1, pending = 0 },
+        })
+        publishSelfTest(report)
+        return report.passed, report.error
+    end
+
+    local connectors = detectedConnectors()
+    local target = command.action == "restore-all" and "*" or command.target
+    local targets = targetsFor(target, connectors)
+    local batch = { nonce = command.nonce, action = command.action, results = {} }
+    commandBatches[command.nonce] = batch
+
+    for _, connector in ipairs(targets) do
+        if activeRequests[connector] or connectorBusy(connector) then
+            batch.results[connector] = { ok = false, error = "output switch is already in progress" }
+        else
+            batch.results[connector] = { pending = true }
+            activeRequests[connector] = { nonce = command.nonce, action = command.action }
+
+            local ok, message
+            if command.action == "assign-image" then
+                ok, message = assignImage(connector, command.path)
+            elseif command.action == "assign-video" then
+                ok, message = assignVideo(connector, command.path, command.preview_path)
+            elseif command.action == "pause" then
+                ok, message = setPlayback(connector, "paused")
+            elseif command.action == "resume" then
+                ok, message = setPlayback(connector, "playing")
+            else
+                ok, message = restoreConnector(connector)
+            end
+
+            if not ok then
+                activeRequests[connector] = nil
+                batch.results[connector] = { ok = false, error = message }
+            end
+        end
+    end
+
+    publishBatch(batch)
+    if summarizeResults(batch.results).pending == 0 then
+        commandBatches[command.nonce] = nil
+    end
+    return true
+end
+
 function onIpc(event, _payload)
     if event == "self-test" then
         runSelfTest(false)
+    end
+end
+
+function onOutputsChanged()
+    reconcileDetectedOutputs()
+end
+
+function onConfigChanged()
+    local currentSignature = settingsSignature()
+    if restartSettingsSignature ~= "" and currentSignature ~= restartSettingsSignature then
+        restartActiveVideos()
+    end
+    restartSettingsSignature = currentSignature
+end
+
+function onExit()
+    local directory = runtimeDirectory()
+    if not directory then
+        return
+    end
+    for connector, live in pairs(runtime) do
+        noctalia.setWallpaperEnabled(connector, true)
+        local socketPath = live.socket_path or socketPathFor(connector, directory)
+        if isOwnedSocket(socketPath, directory) and noctalia.fileExists(socketPath) then
+            local command = "printf '%s\\n' 'stop' | socat -T 2 - UNIX-CONNECT:" .. shellQuote(socketPath)
+            noctalia.runAsync(command)
+        end
     end
 end
 
@@ -947,7 +1272,11 @@ end
 
 noctalia.setUpdateInterval(1000)
 assignments = loadAssignments()
+publishAssignments()
+capabilitiesReady = restoreConnectedAssignments
 if type(noctalia.commandExists) == "function" then
+    restartSettingsSignature = settingsSignature()
+    noctalia.state.watch("command", handleCommand)
     probeCapabilities()
 end
 
@@ -968,9 +1297,12 @@ return {
     processMatchNeedles = processMatchNeedles,
     hiddenFlags = hiddenFlags,
     parseIpcResponse = parseIpcResponse,
+    validateCommand = validateCommand,
+    summarizeResults = summarizeResults,
     buildLaunchCommand = buildLaunchCommand,
     assignVideo = assignVideo,
     assignImage = assignImage,
     setPlayback = setPlayback,
+    handleCommand = handleCommand,
     runSelfTest = runSelfTest,
 }
