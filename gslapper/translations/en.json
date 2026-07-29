@@ -5,6 +5,10 @@
   "widget": {
     "tooltip": "Choose wallpaper"
   },
+  "service": {
+    "self_test_passed": "Self-test passed.",
+    "self_test_failed": "Self-test failed."
+  },
   "settings": {
     "video_directory": {
       "label": "Video directory",
