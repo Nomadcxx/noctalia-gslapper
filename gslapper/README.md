@@ -12,13 +12,16 @@ detected output or select a different file for each connector.
 
 ## Requirements
 
-- [gSlapper](https://github.com/GhostNaN/gSlapper) 1.5.2 or newer
-- `socat`
-- Optional: `gst-launch-1.0` for image and video previews
+- `find` indexes the wallpaper roots
+- [gSlapper](https://github.com/GhostNaN/gSlapper) 1.5.2 or newer renders video
+  wallpapers
+- `gst-launch-1.0` creates image and video previews
+- `pkill` cleans up a plugin-owned process if its socket stops responding
+- `socat` sends gSlapper IPC commands
 
 Arch Linux provides `gst-launch-1.0` in `gstreamer`. Debian and Ubuntu provide
-it in `gstreamer1.0-tools`. The picker uses media placeholders when the command
-is absent.
+it in `gstreamer1.0-tools`. Preview generation can fail without blocking image
+selection or video playback.
 
 To install from the canonical Git source:
 
@@ -44,10 +47,10 @@ Left-click the gSlapper widget to open the picker. Select **All outputs** or a
 connector such as `eDP-1` or `DP-1`, then choose an image or video. The All
 view can pause assigned videos or restore every output.
 
-Open the picker from a shell:
+Toggle the picker from a shell:
 
 ```sh
-noctalia msg panel-open nomadcxx/gslapper:picker
+noctalia msg panel-toggle nomadcxx/gslapper:picker
 ```
 
 The service indexes your image and video roots when Noctalia starts. It creates
