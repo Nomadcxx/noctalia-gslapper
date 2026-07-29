@@ -13,8 +13,8 @@ detected output or select a different file for each connector.
 ## Requirements
 
 - `find` indexes the wallpaper roots
-- [gSlapper](https://github.com/GhostNaN/gSlapper) 1.5.2 or newer renders video
-  wallpapers
+- [gSlapper](https://github.com/GhostNaN/gSlapper) 1.5.2 or newer provides the
+  `gslapper` command and renders video wallpapers
 - `gst-launch-1.0` creates image and video previews
 - `pkill` cleans up a plugin-owned process if its socket stops responding
 - `socat` sends gSlapper IPC commands
