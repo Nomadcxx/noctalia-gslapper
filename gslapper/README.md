@@ -64,11 +64,11 @@ separate selector.
 | --- | --- | --- |
 | Video directory | `~/Videos/Wallpapers` | Root for video wallpapers. Noctalia's wallpaper directory supplies images. |
 | Video scale | `fill` | Uses gSlapper's fill, stretch, original, or panscan scaling mode. |
-| When hidden | `auto-pause` | Continues, pauses, or stops decoding when the video surface is obscured. |
+| When hidden | `auto-pause` | Continues, pauses, or stops decoding when another window covers the video surface. |
 | Loop videos | On | Restarts video playback at the end. |
 | FPS cap | `30` | Caps video wallpaper playback at 30, 60, or 100 FPS. |
 | Fade between videos | Off | Enables gSlapper's fade transition. |
-| Fade duration | `0.5` seconds | Sets the transition duration when fading is enabled. |
+| Fade duration | `0.5` seconds | Sets the transition duration when you enable fading. |
 | Additional GStreamer options | Empty | Appends options to gSlapper's GStreamer option list. |
 | Widget glyph | `wallpaper-selector` | Changes the icon shown in the bar. |
 
@@ -85,13 +85,12 @@ noctalia msg plugin nomadcxx/gslapper:service all self-test
 
 ## Notes
 
-- Each output assigned a video gets one `gslapper` process and one Unix socket
-  under `$XDG_RUNTIME_DIR/noctalia-gslapper/`.
+- The plugin starts one `gslapper` process and one Unix socket under
+  `$XDG_RUNTIME_DIR/noctalia-gslapper/` for each output with a video.
 - The plugin stores assignments, its self-check report, its media index, and
   cached preview JPEGs in Noctalia's plugin data directory. It makes no network
   requests.
-- The picker skips filenames that do not use UTF-8 and reports the count below
-  the folder selector.
+- The picker skips filenames that do not use UTF-8.
 - Static images use Noctalia's wallpaper renderer. For video assignments, the
   plugin disables Noctalia's wallpaper surface on that output while gSlapper
   owns it, then restores the native surface when you select **Restore**.

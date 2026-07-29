@@ -713,10 +713,7 @@ local function resultBanner()
     if #errors > 0 then
         return ui.label({ text = table.concat(errors, "  ·  "), color = "error", maxLines = 2 })
     end
-    return ui.label({
-        text = tr("panel.applied_summary", { count = summary.successful or 0, total = summary.total or 0 }),
-        color = "secondary",
-    })
+    return nil
 end
 
 render = function()
@@ -805,14 +802,6 @@ render = function()
             maxLines = 2,
         }))
     end
-    if (libraryStatus.skipped_invalid_utf8 or 0) > 0 then
-        table.insert(children, ui.label({
-            text = tr("panel.skipped_invalid_utf8", { count = libraryStatus.skipped_invalid_utf8 }),
-            color = "on_surface_variant",
-            fontSize = 11,
-        }))
-    end
-
     local active = activeStrip(connectors)
     if active then table.insert(children, active) end
     local result = resultBanner()

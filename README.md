@@ -6,8 +6,8 @@ different file for each connector.
 
 ![gSlapper wallpaper picker](gslapper/thumbnail.webp)
 
-Install [gSlapper](https://github.com/GhostNaN/gSlapper) 1.5.2 or newer and
-`socat`, then add this Git source:
+Install [gSlapper](https://github.com/GhostNaN/gSlapper) 1.5.2 or newer,
+`find`, `gst-launch-1.0`, `pkill`, and `socat`, then add this Git source:
 
 ```sh
 noctalia msg plugins source add gslapper git https://github.com/Nomadcxx/noctalia-gslapper

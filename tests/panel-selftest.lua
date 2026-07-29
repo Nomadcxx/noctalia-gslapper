@@ -23,4 +23,14 @@ local folders, separatedMedia = picker.partitionEntries({
 }, "")
 assert(#folders == 1 and #separatedMedia == 1, "folders must not consume media page slots")
 
+local panelSource = assert(io.open("gslapper/panel.luau", "r")):read("*a")
+assert(
+    not panelSource:find('tr("panel.applied_summary"', 1, true),
+    "completed wallpaper changes must not leave a success banner"
+)
+assert(
+    not panelSource:find('tr("panel.skipped_invalid_utf8"', 1, true),
+    "invalid-path diagnostics must not occupy the picker"
+)
+
 print("panel self-test: passed")
